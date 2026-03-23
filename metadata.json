@@ -1,0 +1,5 @@
+{
+  "name": "Gemini Live Chat",
+  "description": "Voice chat application with camera and text support using Gemini Live API.",
+  "requestFramePermissions": ["camera", "microphone"]
+}
