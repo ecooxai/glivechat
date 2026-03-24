@@ -106,7 +106,41 @@ export default function LiveChat() {
     }
   }, [pendingImages, isConnected]);
 
-  const startVideo = async (deviceIdOrType?: string | null) => {
+  const stopVideo = useCallback(() => {
+    if (videoStreamRef.current) {
+      videoStreamRef.current.getTracks().forEach(t => t.stop());
+      videoStreamRef.current = null;
+    }
+    if (videoIntervalRef.current) {
+      clearInterval(videoIntervalRef.current);
+      videoIntervalRef.current = null;
+    }
+    setIsVideoEnabled(false);
+  }, []);
+
+  const sendVideoFrame = useCallback(() => {
+    if (!sessionRef.current || !videoRef.current || !canvasRef.current || !isVideoEnabled) return;
+    
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx || video.videoWidth === 0) return;
+    
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
+    const base64Data = dataUrl.split(',')[1];
+    
+    sessionRef.current.then((session: any) => {
+      session.sendRealtimeInput({
+        video: { data: base64Data, mimeType: 'image/jpeg' }
+      });
+    });
+  }, [isVideoEnabled]);
+
+  const startVideo = useCallback(async (deviceIdOrType?: string | null) => {
     try {
       stopVideo();
       
@@ -143,19 +177,7 @@ export default function LiveChat() {
       setIsVideoEnabled(false);
       setSelectedVideoDevice(null);
     }
-  };
-
-  const stopVideo = () => {
-    if (videoStreamRef.current) {
-      videoStreamRef.current.getTracks().forEach(t => t.stop());
-      videoStreamRef.current = null;
-    }
-    if (videoIntervalRef.current) {
-      clearInterval(videoIntervalRef.current);
-      videoIntervalRef.current = null;
-    }
-    setIsVideoEnabled(false);
-  };
+  }, [sendVideoFrame, stopVideo]);
 
   const handleAudioButtonClick = async () => {
     setShowAudioMenu(!showAudioMenu);
@@ -220,28 +242,6 @@ export default function LiveChat() {
     await startVideo(deviceId);
   };
 
-  const sendVideoFrame = () => {
-    if (!sessionRef.current || !videoRef.current || !canvasRef.current || !isVideoEnabled) return;
-    
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    if (!ctx || video.videoWidth === 0) return;
-    
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
-    const base64Data = dataUrl.split(',')[1];
-    
-    sessionRef.current.then((session: any) => {
-      session.sendRealtimeInput({
-        video: { data: base64Data, mimeType: 'image/jpeg' }
-      });
-    });
-  };
-
   const handleDisconnect = useCallback((intentional: boolean) => {
     setIsConnected(false);
     setIsConnecting(false);
@@ -264,7 +264,7 @@ export default function LiveChat() {
         connectRef.current();
       }, 3000);
     }
-  }, []);
+  }, [stopVideo]);
 
   const connect = useCallback(async () => {
     if (isConnecting || isConnected) return;
@@ -295,6 +295,40 @@ export default function LiveChat() {
             },
           },
         ],
+      };
+
+      const setCameraStateTool = {
+        functionDeclarations: [{
+          name: 'setCameraState',
+          description: 'Enable or disable the user\'s camera.',
+          parameters: {
+            type: Type.OBJECT,
+            properties: {
+              enabled: {
+                type: Type.BOOLEAN,
+                description: 'Whether the camera should be enabled or disabled.'
+              }
+            },
+            required: ['enabled']
+          }
+        }]
+      };
+
+      const setTranscriptionStateTool = {
+        functionDeclarations: [{
+          name: 'setTranscriptionState',
+          description: 'Show or hide the transcription (text history) of the conversation.',
+          parameters: {
+            type: Type.OBJECT,
+            properties: {
+              visible: {
+                type: Type.BOOLEAN,
+                description: 'Whether the transcription should be visible or hidden.'
+              }
+            },
+            required: ['visible']
+          }
+        }]
       };
 
       playerRef.current = new AudioStreamPlayer();
@@ -417,6 +451,38 @@ export default function LiveChat() {
 
             if (message.toolCall?.functionCalls) {
               for (const call of message.toolCall.functionCalls) {
+                if (call.name === 'setCameraState') {
+                  const { enabled } = call.args as any;
+                  if (enabled) {
+                    startVideo();
+                  } else {
+                    stopVideo();
+                  }
+                  sessionPromise.then((session: any) => {
+                    session.sendToolResponse({
+                      functionResponses: [{
+                        name: 'setCameraState',
+                        id: call.id,
+                        response: { result: `Camera ${enabled ? 'enabled' : 'disabled'} successfully.` }
+                      }]
+                    });
+                  });
+                }
+
+                if (call.name === 'setTranscriptionState') {
+                  const { visible } = call.args as any;
+                  setShowTranscription(visible);
+                  sessionPromise.then((session: any) => {
+                    session.sendToolResponse({
+                      functionResponses: [{
+                        name: 'setTranscriptionState',
+                        id: call.id,
+                        response: { result: `Transcription ${visible ? 'visible' : 'hidden'} successfully.` }
+                      }]
+                    });
+                  });
+                }
+
                 if (call.name === 'generateImage') {
                   const { prompt } = call.args as any;
                   
@@ -557,10 +623,10 @@ export default function LiveChat() {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: selectedVoice } },
           },
-          systemInstruction: "You are a helpful assistant. You can see the user if they enable their camera. You can also think before you speak. You have a tool to generate or edit images. If the user uploads an image (using the plus button or pasting) and asks to change, edit, or modify it, use the 'generateImage' tool. When using the tool for editing, the prompt should describe the changes relative to the uploaded image. If the user asks to edit an image but hasn't uploaded one, ask them to upload it first. You can see uploaded images as they are sent to you as video frames.",
+          systemInstruction: "You are a helpful assistant. You can see the user if they enable their camera. You can also think before you speak. You have tools to generate or edit images, control the camera, and show/hide the transcription. If the user uploads an image and asks to change, edit, or modify it, use the 'generateImage' tool. If the user asks to open/enable or close/disable the camera, use the 'setCameraState' tool. If the user asks to show or hide the transcription/text history, use the 'setTranscriptionState' tool.",
           outputAudioTranscription: {},
           inputAudioTranscription: {},
-          tools: [generateImageTool],
+          tools: [generateImageTool, setCameraStateTool, setTranscriptionStateTool],
         },
       });
 
@@ -569,7 +635,7 @@ export default function LiveChat() {
       console.error("Connection error:", err);
       handleDisconnect(false);
     }
-  }, [isConnecting, isConnected, selectedModel, selectedVoice, selectedImageModel, handleDisconnect]);
+  }, [isConnecting, isConnected, selectedModel, selectedVoice, selectedImageModel, handleDisconnect, startVideo, stopVideo]);
 
   const disconnect = () => {
     isIntentionalDisconnectRef.current = true;
