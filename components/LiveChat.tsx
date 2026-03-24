@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import Image from 'next/image';
 import { GoogleGenAI, LiveServerMessage, Modality, Type } from '@google/genai';
 import { AudioStreamPlayer, AudioRecorder, createWavUrl } from '@/lib/audio';
-import { Mic, MicOff, Video, VideoOff, Send, Phone, PhoneOff, Loader2, Settings, Volume2, X, ChevronDown, Plus, Trash2 } from 'lucide-react';
+import { Mic, MicOff, Video, VideoOff, Send, Phone, PhoneOff, Loader2, Settings, Volume2, X, ChevronDown, Plus, Trash2, MessageSquareText, MessageSquare } from 'lucide-react';
 
 type Message = {
   id: string;
@@ -31,6 +31,7 @@ export default function LiveChat() {
   const [textInput, setTextInput] = useState('');
   const [pendingImages, setPendingImages] = useState<string[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [showTranscription, setShowTranscription] = useState(true);
   
   // Settings
   const [selectedVoice, setSelectedVoice] = useState('Zephyr');
@@ -171,16 +172,20 @@ export default function LiveChat() {
   };
 
   const handleCameraButtonClick = async () => {
-    setShowVideoMenu(!showVideoMenu);
+    const nextShowMenu = !showVideoMenu;
+    setShowVideoMenu(nextShowMenu);
     setShowAudioMenu(false);
     
-    if (!showVideoMenu) {
+    if (nextShowMenu) {
       try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const videoIn = devices.filter(d => d.kind === 'videoinput');
+        setVideoDevices(videoIn);
+
         if (!isVideoEnabled) {
-          await startVideo(selectedVideoDeviceRef.current);
-        } else {
-          const devices = await navigator.mediaDevices.enumerateDevices();
-          setVideoDevices(devices.filter(d => d.kind === 'videoinput'));
+          // If no device selected, use the first one available
+          const deviceToUse = selectedVideoDeviceRef.current || (videoIn.length > 0 ? videoIn[0].deviceId : null);
+          await startVideo(deviceToUse);
         }
       } catch (err) {
         console.error("Error fetching video devices:", err);
@@ -846,8 +851,20 @@ export default function LiveChat() {
 
       {/* Chat UI Overlay */}
       <div className="relative z-10 flex flex-col h-full w-full max-w-[95vw] mx-auto">
-        <div className="p-4 bg-gradient-to-b from-black/80 to-transparent">
-          <h2 className="font-medium text-neutral-200 drop-shadow-md">Live Assistant</h2>
+        <div className="p-4 bg-gradient-to-b from-black/80 to-transparent flex justify-end items-center transition-all duration-300 hover:bg-black/90">
+          <div className="flex items-center gap-2">
+            <button 
+              onClick={() => setShowTranscription(!showTranscription)}
+              className={`p-2 rounded-full transition-all duration-300 shadow-lg flex items-center justify-center ${
+                showTranscription 
+                  ? 'bg-blue-600/30 text-blue-400 border border-blue-500/40 hover:bg-blue-600/40' 
+                  : 'bg-neutral-800/50 text-neutral-500 border border-neutral-700/30 hover:bg-neutral-800/80 hover:text-neutral-400'
+              }`}
+              title={showTranscription ? 'Hide Transcription' : 'Show Transcription'}
+            >
+              {showTranscription ? <MessageSquareText className="w-4 h-4" /> : <MessageSquare className="w-4 h-4" />}
+            </button>
+          </div>
         </div>
         
         <div className="flex-1 overflow-y-auto p-4 space-y-4 scroll-smooth">
@@ -856,95 +873,100 @@ export default function LiveChat() {
               Connect to start a conversation. You can speak or type your messages.
             </div>
           ) : (
-            messages.map((msg) => (
-              <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`rounded-2xl px-4 py-3 text-sm shadow-lg backdrop-blur-md w-[80vw] ${
-                  msg.role === 'user' 
-                    ? 'bg-blue-600/90 text-white rounded-br-sm border border-blue-500/30' 
-                    : 'bg-neutral-800/90 text-neutral-200 rounded-bl-sm border border-neutral-700/50'
-                }`}>
-                  {msg.role === 'model' ? (
-                    <div className="flex flex-col gap-2">
-                      {msg.isAudio && (
-                        <div className="flex items-center gap-2 text-blue-400 text-xs font-medium uppercase tracking-wider">
-                          <Volume2 className="w-4 h-4" /> Audio Response
-                        </div>
-                      )}
-                      {msg.thought && (
-                        <details className="group">
-                          <summary className="cursor-pointer text-neutral-400 hover:text-neutral-300 select-none text-xs font-medium uppercase tracking-wider flex items-center gap-1">
-                            <span className="group-open:hidden">▶</span>
-                            <span className="hidden group-open:inline">▼</span>
-                            Thinking Process
-                          </summary>
-                          <div className="mt-2 text-green-400 whitespace-pre-wrap font-mono text-xs bg-neutral-950/70 p-3 rounded-lg border border-neutral-800/50">
-                            {msg.thought}
+            messages.map((msg) => {
+              const hasVisibleContent = showTranscription || msg.imageUrl || (msg.userImages && msg.userImages.length > 0);
+              if (!hasVisibleContent) return null;
+
+              return (
+                <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`rounded-2xl px-4 py-3 text-sm shadow-lg backdrop-blur-md w-[80vw] ${
+                    msg.role === 'user' 
+                      ? 'bg-blue-600/90 text-white rounded-br-sm border border-blue-500/30' 
+                      : 'bg-neutral-800/90 text-neutral-200 rounded-bl-sm border border-neutral-700/50'
+                  }`}>
+                    {msg.role === 'model' ? (
+                      <div className="flex flex-col gap-2">
+                        {msg.isAudio && showTranscription && (
+                          <div className="flex items-center gap-2 text-blue-400 text-xs font-medium uppercase tracking-wider">
+                            <Volume2 className="w-4 h-4" /> Audio Response
                           </div>
-                        </details>
-                      )}
-                      {msg.text && (
-                        <div className="text-neutral-100 mt-1">
-                          {msg.text}
-                        </div>
-                      )}
-                      {msg.imageUrl && (
-                        <div className="mt-2 rounded-lg overflow-hidden border border-neutral-700/50 bg-neutral-900/50 relative">
-                          <Image 
-                            src={msg.imageUrl} 
-                            alt="Generated content" 
-                            width={800} 
-                            height={600} 
-                            className="w-full h-auto object-contain max-h-[60vh]" 
-                            referrerPolicy="no-referrer"
-                            unoptimized
-                          />
-                        </div>
-                      )}
-                      {msg.audioUrl && (
-                        <div className="mt-2">
-                          <audio controls src={msg.audioUrl} className="h-8 w-[90%] opacity-90" />
-                        </div>
-                      )}
-                      {msg.tokens && (
-                        <div className="mt-2 text-[10px] text-neutral-400 flex gap-3 border-t border-neutral-700/50 pt-2 uppercase tracking-wider">
-                          <span>Tokens: {msg.tokens.current || 0}</span>
-                          <span>Context: {msg.tokens.total || 0}</span>
-                        </div>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="flex flex-col gap-1">
-                      {msg.isAudio && (
-                        <div className="flex items-center gap-1 text-blue-200 text-xs mb-1">
-                          <Mic className="w-3 h-3" /> Voice Input
-                        </div>
-                      )}
-                      {msg.text}
-                      {msg.userImages && msg.userImages.length > 0 && (
-                        <div className="mt-2 flex flex-wrap gap-2">
-                          {msg.userImages.map((img, idx) => (
-                            <div key={idx} className="relative w-24 h-24 rounded-lg overflow-hidden border border-blue-400/30">
-                              <Image 
-                                src={img} 
-                                alt={`User upload ${idx}`} 
-                                fill 
-                                className="object-cover" 
-                                unoptimized
-                              />
+                        )}
+                        {msg.thought && showTranscription && (
+                          <details className="group">
+                            <summary className="cursor-pointer text-neutral-400 hover:text-neutral-300 select-none text-xs font-medium uppercase tracking-wider flex items-center gap-1">
+                              <span className="group-open:hidden">▶</span>
+                              <span className="hidden group-open:inline">▼</span>
+                              Thinking Process
+                            </summary>
+                            <div className="mt-2 text-green-400 whitespace-pre-wrap font-mono text-xs bg-neutral-950/70 p-3 rounded-lg border border-neutral-800/50">
+                              {msg.thought}
                             </div>
-                          ))}
-                        </div>
-                      )}
-                      {msg.audioUrl && (
-                        <div className="mt-2">
-                          <audio controls src={msg.audioUrl} className="h-8 w-[90%] opacity-90" />
-                        </div>
-                      )}
-                    </div>
-                  )}
+                          </details>
+                        )}
+                        {msg.text && showTranscription && (
+                          <div className="text-neutral-100 mt-1">
+                            {msg.text}
+                          </div>
+                        )}
+                        {msg.imageUrl && (
+                          <div className="mt-2 rounded-lg overflow-hidden border border-neutral-700/50 bg-neutral-900/50 relative">
+                            <Image 
+                              src={msg.imageUrl} 
+                              alt="Generated content" 
+                              width={800} 
+                              height={600} 
+                              className="w-full h-auto object-contain max-h-[60vh]" 
+                              referrerPolicy="no-referrer"
+                              unoptimized
+                            />
+                          </div>
+                        )}
+                        {msg.audioUrl && showTranscription && (
+                          <div className="mt-2">
+                            <audio controls src={msg.audioUrl} className="h-8 w-[90%] opacity-90" />
+                          </div>
+                        )}
+                        {msg.tokens && showTranscription && (
+                          <div className="mt-2 text-[10px] text-neutral-400 flex gap-3 border-t border-neutral-700/50 pt-2 uppercase tracking-wider">
+                            <span>Tokens: {msg.tokens.current || 0}</span>
+                            <span>Context: {msg.tokens.total || 0}</span>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="flex flex-col gap-1">
+                        {msg.isAudio && showTranscription && (
+                          <div className="flex items-center gap-1 text-blue-200 text-xs mb-1">
+                            <Mic className="w-3 h-3" /> Voice Input
+                          </div>
+                        )}
+                        {showTranscription && msg.text}
+                        {msg.userImages && msg.userImages.length > 0 && (
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            {msg.userImages.map((img, idx) => (
+                              <div key={idx} className="relative w-24 h-24 rounded-lg overflow-hidden border border-blue-400/30">
+                                <Image 
+                                  src={img} 
+                                  alt={`User upload ${idx}`} 
+                                  fill 
+                                  className="object-cover" 
+                                  unoptimized
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                        {msg.audioUrl && showTranscription && (
+                          <div className="mt-2">
+                            <audio controls src={msg.audioUrl} className="h-8 w-[90%] opacity-90" />
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-            ))
+              );
+            })
           )}
           <div ref={messagesEndRef} />
         </div>
