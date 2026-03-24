@@ -115,10 +115,20 @@ export class AudioRecorder {
   private sourceNode: MediaStreamAudioSourceNode | null = null;
   private gainNode: GainNode | null = null;
 
-  constructor(private onAudioData: (base64Data: string) => void) {}
+  constructor(private onAudioData: (base64Data: string, volume: number) => void) {}
 
   async start(deviceId?: string) {
-    const constraints = deviceId ? { audio: { deviceId: { exact: deviceId } } } : { audio: true };
+    const constraints: MediaStreamConstraints = {
+      audio: {
+        deviceId: deviceId ? { exact: deviceId } : undefined,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        channelCount: 1,
+        sampleRate: 16000,
+      }
+    };
+    
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
     this.context = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
 
@@ -135,10 +145,21 @@ export class AudioRecorder {
           const input = inputs[0];
           if (input.length > 0) {
             const channelData = input[0];
+            
+            // Calculate volume (RMS)
+            let sum = 0;
+            for (let i = 0; i < channelData.length; i++) {
+              sum += channelData[i] * channelData[i];
+            }
+            const rms = Math.sqrt(sum / channelData.length);
+            
             for (let i = 0; i < channelData.length; i++) {
               this.buffer[this.bytesWritten++] = channelData[i];
               if (this.bytesWritten >= this.bufferSize) {
-                this.port.postMessage(this.buffer);
+                this.port.postMessage({
+                  buffer: this.buffer,
+                  volume: rms
+                });
                 this.bytesWritten = 0;
               }
             }
@@ -156,7 +177,7 @@ export class AudioRecorder {
     this.workletNode = new AudioWorkletNode(this.context, 'pcm-recorder');
     
     this.workletNode.port.onmessage = (event) => {
-      const float32Array = event.data as Float32Array;
+      const { buffer: float32Array, volume } = event.data;
       const int16Array = new Int16Array(float32Array.length);
       for (let i = 0; i < float32Array.length; i++) {
         let s = Math.max(-1, Math.min(1, float32Array[i]));
@@ -164,12 +185,8 @@ export class AudioRecorder {
       }
       
       const bytes = new Uint8Array(int16Array.buffer);
-      let binary = '';
-      for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      const base64 = btoa(binary);
-      this.onAudioData(base64);
+      const base64 = btoa(String.fromCharCode(...bytes));
+      this.onAudioData(base64, volume);
     };
 
     this.sourceNode = this.context.createMediaStreamSource(this.stream);
