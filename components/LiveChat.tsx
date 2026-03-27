@@ -5,7 +5,7 @@ import Image from 'next/image';
 import { GoogleGenAI, LiveServerMessage, Modality, Type } from '@google/genai';
 import { motion, AnimatePresence } from 'motion/react';
 import { AudioStreamPlayer, AudioRecorder, createWavUrl } from '@/lib/audio';
-import { Mic, MicOff, Video, VideoOff, Send, Phone, PhoneOff, Loader2, Settings, Volume2, X, ChevronDown, Plus, Trash2, MessageSquareText, MessageSquare, Camera, Image as ImageIcon, Film, Download, Eye } from 'lucide-react';
+import { Mic, MicOff, Video, VideoOff, Send, Phone, PhoneOff, Loader2, Settings, Volume2, X, ChevronDown, Plus, Trash2, MessageSquareText, MessageSquare, Camera, Image as ImageIcon, Film, Download, Eye, Bookmark, Check } from 'lucide-react';
 
 // IndexedDB Utility for permanent storage
 const DB_NAME = 'LiveChatGallery';
@@ -71,6 +71,7 @@ type Message = {
   text: string;
   thought: string;
   isAudio: boolean;
+  isSilence?: boolean;
   isComplete: boolean;
   audioData?: string[];
   audioUrl?: string;
@@ -80,6 +81,20 @@ type Message = {
     current?: number;
     total?: number;
   };
+};
+
+// Helper to check if text is effectively silent (only punctuation/whitespace/symbols)
+const checkIsSilence = (text: string) => {
+  if (!text) return true;
+  // Remove all non-alphanumeric characters across all languages
+  try {
+    const cleaned = text.trim().replace(/[^\p{L}\p{N}]/gu, '');
+    return cleaned.length === 0;
+  } catch (e) {
+    // Fallback for environments that don't support unicode property escapes
+    const cleaned = text.trim().replace(/[^a-zA-Z0-9]/g, '');
+    return cleaned.length === 0;
+  }
 };
 
 export default function LiveChat() {
@@ -95,6 +110,7 @@ export default function LiveChat() {
   const [showGallery, setShowGallery] = useState(false);
   const [recentShot, setRecentShot] = useState<string | null>(null);
   const [latestGeneratedImage, setLatestGeneratedImage] = useState<string | null>(null);
+  const [isSaved, setIsSaved] = useState(false);
   const [showLargeGeneratedImage, setShowLargeGeneratedImage] = useState(false);
   const recentShotTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [isRecordingVideo, setIsRecordingVideo] = useState(false);
@@ -414,6 +430,31 @@ export default function LiveChat() {
     if (selectedGalleryItem?.id === id) setSelectedGalleryItem(null);
   };
 
+  useEffect(() => {
+    setIsSaved(false);
+  }, [latestGeneratedImage]);
+
+  const saveToGallery = async (url: string) => {
+    if (!url || isSaved) return;
+    
+    const base64Length = url.length - (url.indexOf(',') + 1);
+    const padding = (url.charAt(url.length - 2) === '=') ? 2 : ((url.charAt(url.length - 1) === '=') ? 1 : 0);
+    const fileSize = (base64Length * 0.75) - padding;
+
+    const newItem = {
+      id: `ai_img_${Date.now()}`,
+      type: 'image',
+      url: url,
+      timestamp: Date.now(),
+      resolution: '1024x1024', // Default for AI images
+      size: fileSize
+    };
+    
+    await saveGalleryItem(newItem);
+    setGalleryItems(prev => [newItem, ...prev]);
+    setIsSaved(true);
+  };
+
   const downloadItem = (item: any) => {
     const a = document.createElement('a');
     a.href = item.url;
@@ -540,18 +581,23 @@ export default function LiveChat() {
       playerRef.current = new AudioStreamPlayer();
       recorderRef.current = new AudioRecorder((base64Data, volume) => {
         if (sessionRef.current && !isMicMutedRef.current) {
-          const threshold = 0.0001; // Extremely sensitive threshold
+          const threshold = 0.008; // Less sensitive threshold to avoid noise triggering
           
           if (volume > threshold) {
             if (isSilentRef.current) {
               // User started speaking! New utterance.
               activeUserMessageIdRef.current = Date.now().toString();
-              userAudioBufferRef.current = [];
+              userAudioBufferRef.current = [base64Data];
+            } else {
+              userAudioBufferRef.current.push(base64Data);
             }
             silenceCounterRef.current = 0;
             isSilentRef.current = false;
           } else {
             silenceCounterRef.current++;
+            if (!isSilentRef.current) {
+              userAudioBufferRef.current.push(base64Data);
+            }
           }
 
           // Always send to session so model can detect end of turn
@@ -561,37 +607,35 @@ export default function LiveChat() {
             });
           });
 
-          // Trimming logic for history buffer
-          if (isAutoTrimEnabledRef.current) {
-            // 2048 samples @ 16kHz is ~128ms per chunk. 3 seconds is ~23 chunks.
-            if (silenceCounterRef.current > 23) {
-              if (!isSilentRef.current) {
-                // Trim the last 3 seconds of silence we just captured
-                userAudioBufferRef.current = userAudioBufferRef.current.slice(0, -23);
-                isSilentRef.current = true;
-                
-                // Finalize the audio for this utterance
-                const audioChunks = [...userAudioBufferRef.current];
-                if (audioChunks.length > 0 && activeUserMessageIdRef.current) {
-                  const audioUrl = createWavUrl(audioChunks, 16000);
-                  const msgId = activeUserMessageIdRef.current;
-                  setMessages(prev => {
-                    const index = prev.findIndex(m => m.id === msgId);
-                    if (index !== -1) {
-                      const nextMessages = [...prev];
-                      nextMessages[index] = { ...nextMessages[index], audioUrl, isComplete: true };
-                      return nextMessages;
-                    } else {
-                      return [...prev, { id: msgId, role: 'user', text: '', thought: '', isAudio: true, isComplete: true, audioUrl }];
-                    }
-                  });
+          // Silence detection and finalization
+          // 2048 samples @ 16kHz is ~128ms per chunk. 15 chunks is ~2 seconds.
+          if (silenceCounterRef.current > 15 && !isSilentRef.current) {
+            isSilentRef.current = true;
+            
+            // Finalize the audio for this utterance
+            const audioChunks = [...userAudioBufferRef.current];
+            userAudioBufferRef.current = []; // Clear buffer after finalization
+            
+            // Trim silence if enabled
+            const finalChunks = isAutoTrimEnabledRef.current ? audioChunks.slice(0, -15) : audioChunks;
+            
+            // Require at least 8 chunks (~1 second) to be considered a valid message
+            if (finalChunks.length >= 8 && activeUserMessageIdRef.current) {
+              const audioUrl = createWavUrl(finalChunks, 16000);
+              const msgId = activeUserMessageIdRef.current;
+              setMessages(prev => {
+                const index = prev.findIndex(m => m.id === msgId);
+                if (index !== -1) {
+                  const msg = prev[index];
+                  const nextMessages = [...prev];
+                  const isSilence = checkIsSilence(msg.text);
+                  nextMessages[index] = { ...msg, audioUrl, isComplete: true, isSilence };
+                  return nextMessages;
+                } else {
+                  return [...prev, { id: msgId, role: 'user', text: '', thought: '', isAudio: true, isSilence: true, isComplete: true, audioUrl }];
                 }
-              }
-            } else {
-              userAudioBufferRef.current.push(base64Data);
+              });
             }
-          } else {
-            userAudioBufferRef.current.push(base64Data);
           }
         }
       });
@@ -613,35 +657,38 @@ export default function LiveChat() {
 
             // Helper to finalize user message
             const finalizeUserMessage = () => {
-              setMessages(prev => {
-                const msgId = activeUserMessageIdRef.current;
-                if (!msgId) return prev;
-
-                const index = prev.findIndex(m => m.id === msgId);
-                
-                const audioChunks = [...userAudioBufferRef.current];
-                let audioUrl: string | undefined;
-                if (audioChunks.length > 0) {
-                  audioUrl = createWavUrl(audioChunks, 16000);
-                }
-
-                // Mark as silent so next loud speech starts a new utterance
+              // Require at least 8 chunks (~1 second) to prevent noise-triggered empty messages
+              if (userAudioBufferRef.current.length < 8) {
+                userAudioBufferRef.current = [];
                 isSilentRef.current = true;
+                return;
+              }
+              
+              const audioChunks = [...userAudioBufferRef.current];
+              userAudioBufferRef.current = []; // Clear it!
+              isSilentRef.current = true;
+              
+              const msgId = activeUserMessageIdRef.current;
+              if (!msgId) return;
 
+              const audioUrl = createWavUrl(audioChunks, 16000);
+              
+              setMessages(prev => {
+                const index = prev.findIndex(m => m.id === msgId);
                 if (index !== -1) {
                   const msg = prev[index];
                   const nextMessages = [...prev];
-                  nextMessages[index] = { ...msg, isComplete: true, audioUrl: audioUrl || msg.audioUrl };
+                  const isSilence = checkIsSilence(msg.text);
+                  nextMessages[index] = { ...msg, isComplete: true, isSilence, audioUrl: audioUrl || msg.audioUrl };
                   return nextMessages;
-                } else if (audioChunks.length > 0) {
-                  // Message doesn't exist at all, create it
-                  return [...prev, { id: msgId, role: 'user', text: '', thought: '', isAudio: true, isComplete: true, audioUrl }];
+                } else {
+                  return [...prev, { id: msgId, role: 'user', text: '', thought: '', isAudio: true, isSilence: true, isComplete: true, audioUrl }];
                 }
-                return prev;
               });
             };
 
             if (parts) {
+              finalizeUserMessage();
               // Play audio outside of state updater to prevent double-play in React Strict Mode
               for (const part of parts) {
                 if (part.inlineData && playerRef.current && part.inlineData.data) {
@@ -706,16 +753,20 @@ export default function LiveChat() {
                   if (index !== -1) {
                     const msg = prev[index];
                     const nextMessages = [...prev];
-                    nextMessages[index] = { ...msg, text: msg.text + text };
+                    const newText = msg.text + text;
+                    const isSilence = checkIsSilence(newText);
+                    nextMessages[index] = { ...msg, text: newText, isSilence };
                     return nextMessages;
                   } else {
-                    return [...prev, { id: msgId, role: 'user', text, thought: '', isAudio: true, isComplete: false }];
+                    const isSilence = checkIsSilence(text);
+                    return [...prev, { id: msgId, role: 'user', text, thought: '', isAudio: true, isSilence, isComplete: false }];
                   }
                 } else {
                   // Fallback
                   const newId = Date.now().toString();
                   activeUserMessageIdRef.current = newId;
-                  return [...prev, { id: newId, role: 'user', text, thought: '', isAudio: true, isComplete: false }];
+                  const isSilence = checkIsSilence(text);
+                  return [...prev, { id: newId, role: 'user', text, thought: '', isAudio: true, isSilence, isComplete: false }];
                 }
               });
             }
@@ -890,15 +941,20 @@ export default function LiveChat() {
 
             if (message.usageMetadata) {
               setMessages(prev => {
-                const lastMsg = prev[prev.length - 1];
-                if (lastMsg && lastMsg.role === 'model') {
-                  return [...prev.slice(0, -1), { 
+                const index = prev.map(m => m.role === 'model').lastIndexOf(true);
+                if (index !== -1) {
+                  const lastMsg = prev[index];
+                  const newCurrent = (lastMsg.tokens?.current || 0) + (message.usageMetadata?.responseTokenCount || 0);
+                  const newTotal = (lastMsg.tokens?.total || 0) + (message.usageMetadata?.totalTokenCount || 0);
+                  const nextMessages = [...prev];
+                  nextMessages[index] = { 
                     ...lastMsg, 
                     tokens: {
-                      current: message.usageMetadata?.responseTokenCount,
-                      total: message.usageMetadata?.totalTokenCount
+                      current: newCurrent,
+                      total: newTotal
                     }
-                  }];
+                  };
+                  return nextMessages;
                 }
                 return prev;
               });
@@ -1113,6 +1169,72 @@ export default function LiveChat() {
             onClick={() => setShowLargeGeneratedImage(true)}
           >
             <Image src={latestGeneratedImage} alt="Latest generated" width={120} height={90} className="object-cover transition-transform duration-300 group-hover:scale-110" unoptimized />
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setLatestGeneratedImage(null);
+              }}
+              className="absolute top-1 left-1 z-50 p-1 bg-black/50 rounded-full text-white opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-500"
+              title="Dismiss"
+            >
+              <X className="w-3 h-3" />
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                saveToGallery(latestGeneratedImage);
+              }}
+              className={`absolute top-1 right-1 z-50 p-1 rounded-full text-white opacity-0 group-hover:opacity-100 transition-all ${
+                isSaved ? 'bg-green-500 opacity-100' : 'bg-black/50 hover:bg-blue-500'
+              }`}
+              title={isSaved ? "Saved to Gallery" : "Save to Gallery"}
+              disabled={isSaved}
+            >
+              {isSaved ? <Check className="w-3 h-3" /> : <Bookmark className="w-3 h-3" />}
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                const a = document.createElement('a');
+                a.href = latestGeneratedImage;
+                a.download = `ai_image_${Date.now()}.png`;
+                a.click();
+              }}
+              className="absolute bottom-1 right-1 z-50 p-1 bg-black/50 rounded-full text-white opacity-0 group-hover:opacity-100 transition-opacity hover:bg-blue-500"
+              title="Download"
+            >
+              <Download className="w-3 h-3" />
+            </button>
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!pendingImages.includes(latestGeneratedImage)) {
+                  setPendingImages(prev => [...prev, latestGeneratedImage]);
+                }
+              }}
+              className="absolute bottom-1 left-1 z-50 p-1 bg-black/50 rounded-full text-white opacity-0 group-hover:opacity-100 transition-opacity hover:bg-blue-500"
+              title="Use as Reference"
+            >
+              <Plus className="w-3 h-3" />
+            </button>
+            <button
+              onClick={async (e) => {
+                e.stopPropagation();
+                try {
+                  const response = await fetch(latestGeneratedImage);
+                  const blob = await response.blob();
+                  await navigator.clipboard.write([
+                    new ClipboardItem({ [blob.type]: blob })
+                  ]);
+                } catch (err) {
+                  console.error('Failed to copy image:', err);
+                }
+              }}
+              className="absolute bottom-1 left-1/2 -translate-x-1/2 z-50 p-1 bg-black/50 rounded-full text-white opacity-0 group-hover:opacity-100 transition-opacity hover:bg-blue-500"
+              title="Copy to Clipboard"
+            >
+              <MessageSquare className="w-3 h-3" />
+            </button>
             <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-1">
               <Eye className="w-4 h-4 text-white" />
               <span className="text-white text-xs font-medium">View</span>
@@ -1146,12 +1268,77 @@ export default function LiveChat() {
                 className="w-full h-full object-contain rounded-2xl" 
                 unoptimized 
               />
-              <button
-                onClick={() => setShowLargeGeneratedImage(false)}
-                className="absolute top-4 right-4 p-2 bg-black/50 hover:bg-black/80 text-white rounded-full backdrop-blur-md transition-colors"
-              >
-                <X className="w-6 h-6" />
-              </button>
+              <div className="absolute top-4 right-4 flex gap-2">
+                <button
+                  onClick={async () => {
+                    try {
+                      const response = await fetch(latestGeneratedImage);
+                      const blob = await response.blob();
+                      await navigator.clipboard.write([
+                        new ClipboardItem({ [blob.type]: blob })
+                      ]);
+                      alert('Image copied to clipboard!');
+                    } catch (err) {
+                      console.error('Failed to copy image:', err);
+                      alert('Failed to copy image to clipboard.');
+                    }
+                  }}
+                  className="p-3 bg-black/50 hover:bg-blue-500 text-white rounded-full backdrop-blur-md transition-all"
+                  title="Copy to Clipboard"
+                >
+                  <MessageSquare className="w-6 h-6" />
+                </button>
+                <button
+                  onClick={() => {
+                    if (!pendingImages.includes(latestGeneratedImage)) {
+                      setPendingImages(prev => [...prev, latestGeneratedImage]);
+                    }
+                  }}
+                  className="p-3 bg-black/50 hover:bg-blue-500 text-white rounded-full backdrop-blur-md transition-all"
+                  title="Use as Reference"
+                >
+                  <Plus className="w-6 h-6" />
+                </button>
+                <button
+                  onClick={() => {
+                    const a = document.createElement('a');
+                    a.href = latestGeneratedImage;
+                    a.download = `ai_image_${Date.now()}.png`;
+                    a.click();
+                  }}
+                  className="p-3 bg-black/50 hover:bg-blue-500 text-white rounded-full backdrop-blur-md transition-all"
+                  title="Download"
+                >
+                  <Download className="w-6 h-6" />
+                </button>
+                <button
+                  onClick={() => saveToGallery(latestGeneratedImage)}
+                  className={`p-3 rounded-full text-white backdrop-blur-md transition-all ${
+                    isSaved ? 'bg-green-500' : 'bg-black/50 hover:bg-blue-500'
+                  }`}
+                  title={isSaved ? "Saved to Gallery" : "Save to Gallery"}
+                  disabled={isSaved}
+                >
+                  {isSaved ? <Check className="w-6 h-6" /> : <Bookmark className="w-6 h-6" />}
+                </button>
+                <button
+                  onClick={() => {
+                    setLatestGeneratedImage(null);
+                    setShowLargeGeneratedImage(false);
+                  }}
+                  className="p-3 bg-black/50 hover:bg-red-500 text-white rounded-full backdrop-blur-md transition-all"
+                  title="Dismiss Image"
+                >
+                  <Trash2 className="w-6 h-6" />
+                </button>
+                <button
+                  onClick={() => setShowLargeGeneratedImage(false)}
+                  className="p-3 bg-black/50 hover:bg-black/80 text-white rounded-full backdrop-blur-md transition-colors"
+                  title="Close"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
             </motion.div>
           </motion.div>
         )}
@@ -1174,104 +1361,7 @@ export default function LiveChat() {
         )}
       </AnimatePresence>
 
-      {/* Settings Modal */}
-      {isSettingsOpen && (
-        <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-          <div className="bg-neutral-900 border border-neutral-800 rounded-2xl p-6 w-full max-w-md shadow-2xl">
-            <div className="flex justify-between items-center mb-6">
-              <h3 className="text-xl font-medium text-neutral-100">Settings</h3>
-              <button onClick={() => setIsSettingsOpen(false)} className="text-neutral-400 hover:text-white">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-            
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-neutral-400 mb-1">Model</label>
-                <select 
-                  value={selectedModel}
-                  onChange={(e) => setSelectedModel(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-neutral-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                >
-                  <option value="gemini-2.5-flash-native-audio-preview-12-2025">Gemini 2.5 Flash Native Audio</option>
-                  <option value="gemini-3.1-flash-live-preview">Gemini 3.1 Flash Live Preview</option>
-                  <option value="gemini-3.1-flash-preview">Gemini 3.1 Flash Preview</option>
-                  <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro Preview</option>
-                </select>
-                <p className="text-xs text-neutral-500 mt-1">Session will restart on change.</p>
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-neutral-400 mb-1">Voice</label>
-                <select 
-                  value={selectedVoice}
-                  onChange={(e) => setSelectedVoice(e.target.value)}
-                  className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-neutral-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                >
-                  <option value="Puck">Puck</option>
-                  <option value="Charon">Charon</option>
-                  <option value="Kore">Kore</option>
-                  <option value="Fenrir">Fenrir</option>
-                  <option value="Zephyr">Zephyr</option>
-                </select>
-                <p className="text-xs text-neutral-500 mt-1">Session will restart on change.</p>
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-neutral-400 mb-1">Image Model</label>
-                <select 
-                  value={selectedImageModel}
-                  onChange={async (e) => {
-                    const model = e.target.value;
-                    setSelectedImageModel(model);
-                    if (model === 'gemini-3.1-flash-image-preview' || model === 'gemini-3-pro-image-preview') {
-                      const hasKey = await (window as any).aistudio.hasSelectedApiKey();
-                      if (!hasKey) {
-                        await (window as any).aistudio.openSelectKey();
-                      }
-                    }
-                  }}
-                  className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-neutral-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-                >
-                  <option value="gemini-2.5-flash-image">Nano Banana (2.5 Flash)</option>
-                  <option value="gemini-3.1-flash-image-preview">Banana 2 (3.1 Flash)</option>
-                  <option value="gemini-3-pro-image-preview">Banana Pro (3 Pro)</option>
-                </select>
-                <p className="text-xs text-neutral-500 mt-1">
-                  Select model for image generation. 
-                  {(selectedImageModel === 'gemini-3.1-flash-image-preview' || selectedImageModel === 'gemini-3-pro-image-preview') && (
-                    <span className="block text-blue-400 mt-1">
-                      Requires paid API key. See <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noopener noreferrer" className="underline">billing docs</a>.
-                    </span>
-                  )}
-                </p>
-              </div>
-
-              <div className="flex items-center justify-between pt-2 border-t border-neutral-800">
-                <div>
-                  <label className="block text-sm font-medium text-neutral-200">Auto Trim Silence</label>
-                  <p className="text-xs text-neutral-500">Removes silences longer than 3s from saved recordings.</p>
-                </div>
-                <button 
-                  onClick={() => setIsAutoTrimEnabled(!isAutoTrimEnabled)}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${isAutoTrimEnabled ? 'bg-blue-600' : 'bg-neutral-700'}`}
-                >
-                  <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${isAutoTrimEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
-                </button>
-              </div>
-            </div>
-            
-            <div className="mt-8 flex justify-end">
-              <button 
-                onClick={() => setIsSettingsOpen(false)}
-                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-              >
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Settings Panel is now handled in the bottom toolbar area */}
 
       {/* Video Background */}
       <video 
@@ -1316,7 +1406,7 @@ export default function LiveChat() {
             <AnimatePresence mode="popLayout">
               {messages.map((msg) => {
                 const hasVisibleContent = showTranscription;
-                if (!hasVisibleContent) return null;
+                if (!hasVisibleContent || msg.isSilence) return null;
 
                 return (
                   <motion.div 
@@ -1369,6 +1459,34 @@ export default function LiveChat() {
                                 referrerPolicy="no-referrer"
                                 unoptimized
                               />
+                              <div className="absolute top-3 right-3 z-20 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex gap-2">
+                                <button
+                                  onClick={async () => {
+                                    try {
+                                      const response = await fetch(msg.imageUrl!);
+                                      const blob = await response.blob();
+                                      await navigator.clipboard.write([
+                                        new ClipboardItem({ [blob.type]: blob })
+                                      ]);
+                                      alert('Image copied to clipboard!');
+                                    } catch (err) {
+                                      console.error('Failed to copy image:', err);
+                                      alert('Failed to copy image to clipboard.');
+                                    }
+                                  }}
+                                  className="p-2 bg-black/60 backdrop-blur-md rounded-full text-white hover:bg-blue-600 transition-all border border-white/10"
+                                  title="Copy to Clipboard"
+                                >
+                                  <MessageSquare className="w-4 h-4" />
+                                </button>
+                                <button
+                                  onClick={() => saveToGallery(msg.imageUrl!)}
+                                  className="p-2 bg-black/60 backdrop-blur-md rounded-full text-white hover:bg-blue-600 transition-all border border-white/10"
+                                  title="Save to Gallery"
+                                >
+                                  <Bookmark className="w-4 h-4" />
+                                </button>
+                              </div>
                               <div className="absolute bottom-3 right-3 z-20 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
                                 <span className="text-[10px] uppercase tracking-widest bg-black/60 backdrop-blur-md px-2 py-1 rounded border border-white/10 text-white/70">
                                   AI Generated
@@ -1382,9 +1500,15 @@ export default function LiveChat() {
                             </div>
                           )}
                           {msg.tokens && showTranscription && (
-                            <div className="mt-2 text-[10px] text-neutral-400 flex gap-3 border-t border-neutral-700/50 pt-2 uppercase tracking-wider">
-                              <span>Tokens: {msg.tokens.current || 0}</span>
-                              <span>Context: {msg.tokens.total || 0}</span>
+                            <div className="mt-2 text-[10px] flex gap-3 border-t border-neutral-700/50 pt-2 uppercase tracking-wider font-mono">
+                              <span className="flex items-center gap-1">
+                                <span className="text-neutral-500">Tokens:</span>
+                                <span className="text-blue-400 font-bold">{(msg.tokens.current || 0).toLocaleString()}</span>
+                              </span>
+                              <span className="flex items-center gap-1">
+                                <span className="text-neutral-500">Context:</span>
+                                <span className="text-neutral-300 font-bold">{(msg.tokens.total || 0).toLocaleString()}</span>
+                              </span>
                             </div>
                           )}
                         </div>
@@ -1399,7 +1523,7 @@ export default function LiveChat() {
                           {msg.userImages && msg.userImages.length > 0 && (
                             <div className="mt-2 flex flex-wrap gap-2">
                               {msg.userImages.map((img, idx) => (
-                                <div key={idx} className="relative w-24 h-24 rounded-lg overflow-hidden border border-blue-400/30">
+                                <div key={idx} className="relative w-24 h-24 rounded-lg overflow-hidden border border-blue-400/30 group/img">
                                   <Image 
                                     src={img} 
                                     alt={`User upload ${idx}`} 
@@ -1407,6 +1531,26 @@ export default function LiveChat() {
                                     className="object-cover" 
                                     unoptimized
                                   />
+                                  <button
+                                    onClick={async (e) => {
+                                      e.stopPropagation();
+                                      try {
+                                        const response = await fetch(img);
+                                        const blob = await response.blob();
+                                        await navigator.clipboard.write([
+                                          new ClipboardItem({ [blob.type]: blob })
+                                        ]);
+                                        alert('Image copied to clipboard!');
+                                      } catch (err) {
+                                        console.error('Failed to copy image:', err);
+                                        alert('Failed to copy image to clipboard.');
+                                      }
+                                    }}
+                                    className="absolute top-1 right-1 z-20 opacity-0 group-hover/img:opacity-100 transition-opacity p-1 bg-black/60 rounded-full text-white hover:bg-blue-600"
+                                    title="Copy to Clipboard"
+                                  >
+                                    <MessageSquare className="w-3 h-3" />
+                                  </button>
                                 </div>
                               ))}
                             </div>
@@ -1422,13 +1566,296 @@ export default function LiveChat() {
                   </motion.div>
                 );
               })}
+
+              {/* Silence Audio Group */}
+              {showTranscription && messages.some(m => m.isSilence) && (
+                <motion.div 
+                  key="silence-group"
+                  layout
+                  initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  transition={{ duration: 0.2, ease: "easeOut" }}
+                  className="flex justify-end"
+                >
+                  <div className="rounded-2xl px-4 py-3 text-sm shadow-lg backdrop-blur-md w-[80vw] bg-blue-600/90 text-white rounded-br-sm border border-blue-500/30">
+                    <details className="group">
+                      <summary className="cursor-pointer text-blue-200 hover:text-white select-none text-xs font-medium uppercase tracking-wider flex items-center gap-1">
+                        <span className="group-open:hidden">▶</span>
+                        <span className="hidden group-open:inline">▼</span>
+                        <Mic className="w-3 h-3" /> Silence Audio ({messages.filter(m => m.isSilence).length})
+                      </summary>
+                      <div className="mt-2 space-y-2 max-h-60 overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-white/20 scrollbar-track-transparent">
+                        {messages.filter(m => m.isSilence).map((msg) => (
+                          <div key={msg.id} className="bg-black/20 rounded-xl p-2 border border-white/5 shadow-inner">
+                            <audio controls src={msg.audioUrl} className="h-8 w-full opacity-80 hover:opacity-100 transition-opacity" />
+                          </div>
+                        ))}
+                      </div>
+                    </details>
+                  </div>
+                </motion.div>
+              )}
             </AnimatePresence>
           )}
           <div ref={messagesEndRef} />
         </div>
 
         {/* Bottom Area: Input + Controls */}
-        <div className="p-4 bg-neutral-950/80 backdrop-blur-xl border-t border-neutral-800/50 flex flex-col gap-4">
+        <div className="p-4 bg-neutral-950/80 backdrop-blur-xl border-t border-neutral-800/50 flex flex-col gap-4 relative">
+          {/* Gallery Panel (Moved here to be above toolbar) */}
+          <AnimatePresence>
+            {showGallery && (
+              <motion.div 
+                initial={{ opacity: 0, y: 20, scale: 0.95 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 20, scale: 0.95 }}
+                className="absolute bottom-full left-0 right-0 z-50 mb-4 mx-2 bg-neutral-900/95 backdrop-blur-xl border border-neutral-800 rounded-3xl shadow-2xl max-h-[70vh] overflow-hidden flex flex-col"
+              >
+                <div className="p-6 border-b border-neutral-800 flex justify-between items-center bg-neutral-900/50 backdrop-blur-xl">
+                  <div>
+                    <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                      <ImageIcon className="w-5 h-5 text-blue-400" />
+                      Media Gallery
+                    </h2>
+                    <p className="text-xs text-neutral-500 mt-1">Photos and videos captured during your session</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {galleryItems.length > 0 && (
+                      <>
+                        <button 
+                          onClick={() => {
+                            galleryItems.forEach(item => {
+                              const a = document.createElement('a');
+                              a.href = item.url;
+                              a.download = `${item.type}_${item.id}.${item.type === 'image' ? 'jpg' : 'webm'}`;
+                              a.click();
+                            });
+                          }}
+                          className="p-2 rounded-full hover:bg-blue-500/20 text-blue-400 transition-all flex items-center gap-2 text-xs font-medium"
+                          title="Download All"
+                        >
+                          <Download className="w-4 h-4" />
+                          <span className="hidden sm:inline">Download All</span>
+                        </button>
+                        <button 
+                          onClick={async () => {
+                            if (confirm('Are you sure you want to clear all gallery items?')) {
+                              for (const item of galleryItems) {
+                                await deleteGalleryItem(item.id);
+                              }
+                              setGalleryItems([]);
+                            }
+                          }}
+                          className="p-2 rounded-full hover:bg-red-500/20 text-red-500 transition-all flex items-center gap-2 text-xs font-medium"
+                          title="Clear All"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                          <span className="hidden sm:inline">Clear All</span>
+                        </button>
+                      </>
+                    )}
+                    <button 
+                      onClick={() => setShowGallery(false)}
+                      className="p-2 rounded-full hover:bg-neutral-800 text-neutral-400 hover:text-white transition-all"
+                    >
+                      <X className="w-6 h-6" />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-6">
+                  {galleryItems.length === 0 ? (
+                    <div className="h-64 flex flex-col items-center justify-center text-neutral-600 gap-4">
+                      <div className="p-6 rounded-full bg-neutral-800/50">
+                        <Camera className="w-12 h-12 opacity-20" />
+                      </div>
+                      <p>No media captured yet</p>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+                      {galleryItems.map(item => (
+                        <div 
+                          key={item.id} 
+                          className="group relative aspect-square rounded-2xl overflow-hidden border border-neutral-800 bg-black hover:border-blue-500/50 transition-all cursor-pointer flex flex-col"
+                          onClick={() => setSelectedGalleryItem(item)}
+                        >
+                          <div className="flex-1 relative w-full h-full">
+                            {item.type === 'image' ? (
+                              <Image src={item.url} alt="Captured" fill className="object-cover group-hover:scale-110 transition-transform duration-500" unoptimized />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center bg-neutral-800">
+                                <Film className="w-8 h-8 text-neutral-500" />
+                                <div className="absolute inset-0 bg-black/20 group-hover:bg-black/0 transition-colors" />
+                              </div>
+                            )}
+                          </div>
+                          <div className="absolute top-2 left-2 px-2 py-1 rounded-md bg-black/60 backdrop-blur-md text-[10px] font-medium text-white border border-white/10 opacity-0 group-hover:opacity-100 transition-opacity">
+                            {item.type.toUpperCase()}
+                          </div>
+                          <div className="absolute bottom-0 inset-x-0 bg-black/80 backdrop-blur-md p-2 text-[10px] text-neutral-300 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col gap-0.5 z-10">
+                            <div className="flex justify-between">
+                              <span className="uppercase font-bold text-white">{item.type}</span>
+                              <span>{formatSize(item.size)}</span>
+                            </div>
+                            <div className="text-neutral-400">{item.resolution || 'Unknown resolution'}</div>
+                          </div>
+                          <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-4 z-20">
+                            <button 
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (item.type === 'image' && !pendingImages.includes(item.url)) {
+                                  setPendingImages(prev => [...prev, item.url]);
+                                  setShowGallery(false);
+                                }
+                              }}
+                              className="p-3 rounded-full bg-blue-600/80 text-white hover:bg-blue-500 transition-colors backdrop-blur-sm"
+                              title="Add to Input"
+                            >
+                              <Plus className="w-5 h-5" />
+                            </button>
+                            <button 
+                              onClick={(e) => { e.stopPropagation(); downloadItem(item); }}
+                              className="p-3 rounded-full bg-blue-600/80 text-white hover:bg-blue-500 transition-colors backdrop-blur-sm"
+                              title="Download"
+                            >
+                              <Download className="w-5 h-5" />
+                            </button>
+                            <button 
+                              onClick={(e) => { e.stopPropagation(); deleteItem(item.id); }}
+                              className="p-3 rounded-full bg-red-600/80 text-white hover:bg-red-500 transition-colors backdrop-blur-sm"
+                              title="Delete"
+                            >
+                              <Trash2 className="w-5 h-5" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+      {/* Settings Panel (Moved here to be above toolbar) */}
+          <AnimatePresence>
+            {isSettingsOpen && (
+              <motion.div 
+                initial={{ opacity: 0, y: 20, scale: 0.95 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 20, scale: 0.95 }}
+                className="absolute bottom-full left-0 right-0 z-50 mb-4 mx-2 bg-neutral-900/95 backdrop-blur-xl border border-neutral-800 rounded-3xl shadow-2xl max-h-[70vh] overflow-hidden flex flex-col"
+              >
+                <div className="p-6 border-b border-neutral-800 flex justify-between items-center bg-neutral-900/50 backdrop-blur-xl">
+                  <div>
+                    <h2 className="text-xl font-bold text-white flex items-center gap-2">
+                      <Settings className="w-5 h-5 text-blue-400" />
+                      Settings
+                    </h2>
+                    <p className="text-xs text-neutral-500 mt-1">Configure your session and models</p>
+                  </div>
+                  <button 
+                    onClick={() => setIsSettingsOpen(false)}
+                    className="p-2 rounded-full hover:bg-neutral-800 text-neutral-400 hover:text-white transition-all"
+                  >
+                    <X className="w-6 h-6" />
+                  </button>
+                </div>
+                
+                <div className="p-6 overflow-y-auto custom-scrollbar">
+                  <div className="space-y-6 max-w-2xl mx-auto">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      <div>
+                        <label className="block text-sm font-medium text-neutral-400 mb-2">Model</label>
+                        <select 
+                          value={selectedModel}
+                          onChange={(e) => setSelectedModel(e.target.value)}
+                          className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-neutral-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 transition-all"
+                        >
+                          <option value="gemini-2.5-flash-native-audio-preview-12-2025">Gemini 2.5 Flash Native Audio</option>
+                          <option value="gemini-3.1-flash-live-preview">Gemini 3.1 Flash Live Preview</option>
+                          <option value="gemini-3.1-flash-preview">Gemini 3.1 Flash Preview</option>
+                          <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro Preview</option>
+                        </select>
+                        <p className="text-[10px] text-neutral-500 mt-2 uppercase tracking-wider">Session will restart on change</p>
+                      </div>
+                      
+                      <div>
+                        <label className="block text-sm font-medium text-neutral-400 mb-2">Voice</label>
+                        <select 
+                          value={selectedVoice}
+                          onChange={(e) => setSelectedVoice(e.target.value)}
+                          className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-neutral-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 transition-all"
+                        >
+                          <option value="Puck">Puck</option>
+                          <option value="Charon">Charon</option>
+                          <option value="Kore">Kore</option>
+                          <option value="Fenrir">Fenrir</option>
+                          <option value="Zephyr">Zephyr</option>
+                        </select>
+                        <p className="text-[10px] text-neutral-500 mt-2 uppercase tracking-wider">Session will restart on change</p>
+                      </div>
+                    </div>
+                    
+                    <div className="pt-6 border-t border-neutral-800">
+                      <label className="block text-sm font-medium text-neutral-400 mb-2">Image Model</label>
+                      <select 
+                        value={selectedImageModel}
+                        onChange={async (e) => {
+                          const model = e.target.value;
+                          setSelectedImageModel(model);
+                          if (model === 'gemini-3.1-flash-image-preview' || model === 'gemini-3-pro-image-preview') {
+                            const hasKey = await (window as any).aistudio.hasSelectedApiKey();
+                            if (!hasKey) {
+                              await (window as any).aistudio.openSelectKey();
+                            }
+                          }
+                        }}
+                        className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-neutral-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 transition-all"
+                      >
+                        <option value="gemini-2.5-flash-image">Nano Banana (2.5 Flash)</option>
+                        <option value="gemini-3.1-flash-image-preview">Banana 2 (3.1 Flash)</option>
+                        <option value="gemini-3-pro-image-preview">Banana Pro (3 Pro)</option>
+                      </select>
+                      <div className="mt-2 p-3 bg-neutral-950/50 rounded-lg border border-neutral-800/50">
+                        <p className="text-xs text-neutral-500">
+                          Select model for image generation. 
+                          {(selectedImageModel === 'gemini-3.1-flash-image-preview' || selectedImageModel === 'gemini-3-pro-image-preview') && (
+                            <span className="block text-blue-400 mt-1 font-medium">
+                              Requires paid API key. See <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" rel="noopener noreferrer" className="underline hover:text-blue-300">billing docs</a>.
+                            </span>
+                          )}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between p-4 bg-neutral-950/50 rounded-2xl border border-neutral-800/50">
+                      <div>
+                        <label className="block text-sm font-medium text-neutral-200">Auto Trim Silence</label>
+                        <p className="text-xs text-neutral-500">Removes silences longer than 3s from saved recordings.</p>
+                      </div>
+                      <button 
+                        onClick={() => setIsAutoTrimEnabled(!isAutoTrimEnabled)}
+                        className={`relative inline-flex h-7 w-12 items-center rounded-full transition-all focus:outline-none ${isAutoTrimEnabled ? 'bg-blue-600' : 'bg-neutral-700'}`}
+                      >
+                        <span className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-lg transition-transform ${isAutoTrimEnabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                      </button>
+                    </div>
+
+                    <div className="pt-4 flex justify-end">
+                      <button 
+                        onClick={() => setIsSettingsOpen(false)}
+                        className="px-8 py-3 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-500 transition-all shadow-lg shadow-blue-600/20 active:scale-95"
+                      >
+                        Done
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
           {pendingImages.length > 0 && (
             <div className="flex flex-wrap gap-2 pb-2">
               {pendingImages.map((img, idx) => (
@@ -1506,8 +1933,12 @@ export default function LiveChat() {
             </button>
 
             <button 
-              onClick={() => setShowGallery(true)}
-              className="p-3 rounded-full bg-neutral-800 text-neutral-200 hover:bg-neutral-700 transition-all duration-300 flex items-center justify-center relative"
+              onClick={() => setShowGallery(!showGallery)}
+              className={`p-3 rounded-full transition-all duration-300 flex items-center justify-center relative ${
+                showGallery 
+                  ? 'bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/20' 
+                  : 'bg-neutral-800 text-neutral-200 hover:bg-neutral-700'
+              }`}
               title="Gallery"
             >
               <ImageIcon className="w-5 h-5" />
@@ -1648,8 +2079,12 @@ export default function LiveChat() {
             <div className="hidden md:block w-px h-6 bg-neutral-800 mx-1"></div>
 
             <button 
-              onClick={() => setIsSettingsOpen(true)}
-              className="p-3 rounded-full bg-neutral-800 text-neutral-200 hover:bg-neutral-700 transition-colors"
+              onClick={() => setIsSettingsOpen(!isSettingsOpen)}
+              className={`p-3 rounded-full transition-all duration-300 flex items-center justify-center ${
+                isSettingsOpen 
+                  ? 'bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/20' 
+                  : 'bg-neutral-800 text-neutral-200 hover:bg-neutral-700'
+              }`}
               title="Settings"
             >
               <Settings className="w-5 h-5" />
@@ -1657,99 +2092,6 @@ export default function LiveChat() {
           </div>
         </div>
       </div>
-
-      {/* Gallery Modal */}
-      <AnimatePresence>
-        {showGallery && (
-          <motion.div 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/90 backdrop-blur-md"
-          >
-            <motion.div 
-              initial={{ scale: 0.9, y: 20 }}
-              animate={{ scale: 1, y: 0 }}
-              exit={{ scale: 0.9, y: 20 }}
-              className="bg-neutral-900 border border-neutral-800 w-full max-w-4xl max-h-[85vh] rounded-3xl overflow-hidden flex flex-col shadow-2xl"
-            >
-              <div className="p-6 border-b border-neutral-800 flex justify-between items-center bg-neutral-900/50 backdrop-blur-xl">
-                <div>
-                  <h2 className="text-xl font-bold text-white flex items-center gap-2">
-                    <ImageIcon className="w-5 h-5 text-blue-400" />
-                    Media Gallery
-                  </h2>
-                  <p className="text-xs text-neutral-500 mt-1">Photos and videos captured during your session</p>
-                </div>
-                <button 
-                  onClick={() => setShowGallery(false)}
-                  className="p-2 rounded-full hover:bg-neutral-800 text-neutral-400 hover:text-white transition-all"
-                >
-                  <X className="w-6 h-6" />
-                </button>
-              </div>
-
-              <div className="flex-1 overflow-y-auto p-6">
-                {galleryItems.length === 0 ? (
-                  <div className="h-64 flex flex-col items-center justify-center text-neutral-600 gap-4">
-                    <div className="p-6 rounded-full bg-neutral-800/50">
-                      <Camera className="w-12 h-12 opacity-20" />
-                    </div>
-                    <p>No media captured yet</p>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-                    {galleryItems.map(item => (
-                      <div 
-                        key={item.id} 
-                        className="group relative aspect-square rounded-2xl overflow-hidden border border-neutral-800 bg-black hover:border-blue-500/50 transition-all cursor-pointer flex flex-col"
-                        onClick={() => setSelectedGalleryItem(item)}
-                      >
-                        <div className="flex-1 relative w-full h-full">
-                          {item.type === 'image' ? (
-                            <Image src={item.url} alt="Captured" fill className="object-cover group-hover:scale-110 transition-transform duration-500" unoptimized />
-                          ) : (
-                            <div className="w-full h-full flex items-center justify-center bg-neutral-800">
-                              <Film className="w-8 h-8 text-neutral-500" />
-                              <div className="absolute inset-0 bg-black/20 group-hover:bg-black/0 transition-colors" />
-                            </div>
-                          )}
-                        </div>
-                        <div className="absolute top-2 left-2 px-2 py-1 rounded-md bg-black/60 backdrop-blur-md text-[10px] font-medium text-white border border-white/10 opacity-0 group-hover:opacity-100 transition-opacity">
-                          {item.type.toUpperCase()}
-                        </div>
-                        <div className="absolute bottom-0 inset-x-0 bg-black/80 backdrop-blur-md p-2 text-[10px] text-neutral-300 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col gap-0.5 z-10">
-                          <div className="flex justify-between">
-                            <span className="uppercase font-bold text-white">{item.type}</span>
-                            <span>{formatSize(item.size)}</span>
-                          </div>
-                          <div className="text-neutral-400">{item.resolution || 'Unknown resolution'}</div>
-                        </div>
-                        <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-4 z-20">
-                          <button 
-                            onClick={(e) => { e.stopPropagation(); downloadItem(item); }}
-                            className="p-3 rounded-full bg-blue-600/80 text-white hover:bg-blue-500 transition-colors backdrop-blur-sm"
-                            title="Download"
-                          >
-                            <Download className="w-5 h-5" />
-                          </button>
-                          <button 
-                            onClick={(e) => { e.stopPropagation(); deleteItem(item.id); }}
-                            className="p-3 rounded-full bg-red-600/80 text-white hover:bg-red-500 transition-colors backdrop-blur-sm"
-                            title="Delete"
-                          >
-                            <Trash2 className="w-5 h-5" />
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       {/* Media Preview Modal */}
       <AnimatePresence>
@@ -1769,6 +2111,19 @@ export default function LiveChat() {
               onClick={e => e.stopPropagation()}
             >
               <div className="absolute -top-12 right-0 flex gap-2">
+                <button 
+                  onClick={() => {
+                    if (selectedGalleryItem.type === 'image' && !pendingImages.includes(selectedGalleryItem.url)) {
+                      setPendingImages(prev => [...prev, selectedGalleryItem.url]);
+                      setSelectedGalleryItem(null);
+                      setShowGallery(false);
+                    }
+                  }}
+                  className="p-3 rounded-full bg-blue-600 text-white hover:bg-blue-500 transition-all"
+                  title="Add to Input"
+                >
+                  <Plus className="w-5 h-5" />
+                </button>
                 <button 
                   onClick={() => downloadItem(selectedGalleryItem)}
                   className="p-3 rounded-full bg-blue-600 text-white hover:bg-blue-500 transition-all"
