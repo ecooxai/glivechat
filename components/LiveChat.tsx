@@ -58,6 +58,13 @@ async function deleteGalleryItem(id: string) {
   });
 }
 
+const formatSize = (bytes?: number) => {
+  if (!bytes) return 'Unknown size';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+};
+
 type Message = {
   id: string;
   role: 'user' | 'model';
@@ -86,6 +93,10 @@ export default function LiveChat() {
   const [showTranscription, setShowTranscription] = useState(true);
   const [galleryItems, setGalleryItems] = useState<any[]>([]);
   const [showGallery, setShowGallery] = useState(false);
+  const [recentShot, setRecentShot] = useState<string | null>(null);
+  const [latestGeneratedImage, setLatestGeneratedImage] = useState<string | null>(null);
+  const [showLargeGeneratedImage, setShowLargeGeneratedImage] = useState(false);
+  const recentShotTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const [isRecordingVideo, setIsRecordingVideo] = useState(false);
   const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
   const [selectedGalleryItem, setSelectedGalleryItem] = useState<any | null>(null);
@@ -97,7 +108,7 @@ export default function LiveChat() {
   
   // Settings
   const [selectedVoice, setSelectedVoice] = useState('Zephyr');
-  const [selectedModel, setSelectedModel] = useState('gemini-2.5-flash-native-audio-preview-12-2025');
+  const [selectedModel, setSelectedModel] = useState('gemini-3.1-flash-live-preview');
   const [selectedImageModel, setSelectedImageModel] = useState('gemini-2.5-flash-image');
 
   const prevVoiceRef = useRef(selectedVoice);
@@ -263,9 +274,11 @@ export default function LiveChat() {
   }, [sendVideoFrame, stopVideo]);
 
   const handleAudioButtonClick = async () => {
-    setShowAudioMenu(!showAudioMenu);
-    setShowVideoMenu(false);
-    if (!showAudioMenu) {
+    if (showAudioMenu) {
+      changeAudioDevice('disable');
+    } else {
+      setShowAudioMenu(true);
+      setShowVideoMenu(false);
       try {
         await navigator.mediaDevices.getUserMedia({ audio: true });
         const devices = await navigator.mediaDevices.enumerateDevices();
@@ -277,11 +290,11 @@ export default function LiveChat() {
   };
 
   const handleCameraButtonClick = async () => {
-    const nextShowMenu = !showVideoMenu;
-    setShowVideoMenu(nextShowMenu);
-    setShowAudioMenu(false);
-    
-    if (nextShowMenu) {
+    if (showVideoMenu) {
+      changeVideoDevice('disable');
+    } else {
+      setShowVideoMenu(true);
+      setShowAudioMenu(false);
       try {
         const devices = await navigator.mediaDevices.enumerateDevices();
         const videoIn = devices.filter(d => d.kind === 'videoinput');
@@ -331,15 +344,25 @@ export default function LiveChat() {
     ctx.drawImage(video, 0, 0);
     const dataUrl = canvas.toDataURL('image/jpeg');
     
+    const base64Length = dataUrl.length - (dataUrl.indexOf(',') + 1);
+    const padding = (dataUrl.charAt(dataUrl.length - 2) === '=') ? 2 : ((dataUrl.charAt(dataUrl.length - 1) === '=') ? 1 : 0);
+    const fileSize = (base64Length * 0.75) - padding;
+
     const newItem = {
       id: `img_${Date.now()}`,
       type: 'image',
       url: dataUrl,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      resolution: `${video.videoWidth}x${video.videoHeight}`,
+      size: fileSize
     };
     
     await saveGalleryItem(newItem);
     setGalleryItems(prev => [newItem, ...prev]);
+
+    setRecentShot(dataUrl);
+    if (recentShotTimeoutRef.current) clearTimeout(recentShotTimeoutRef.current);
+    recentShotTimeoutRef.current = setTimeout(() => setRecentShot(null), 3000);
   };
 
   const startVideoRecording = async () => {
@@ -357,11 +380,17 @@ export default function LiveChat() {
       reader.readAsDataURL(blob);
       reader.onloadend = async () => {
         const base64data = reader.result as string;
+        const base64Length = base64data.length - (base64data.indexOf(',') + 1);
+        const padding = (base64data.charAt(base64data.length - 2) === '=') ? 2 : ((base64data.charAt(base64data.length - 1) === '=') ? 1 : 0);
+        const fileSize = (base64Length * 0.75) - padding;
+
         const newItem = {
           id: `vid_${Date.now()}`,
           type: 'video',
           url: base64data,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          resolution: `${videoRef.current?.videoWidth || 0}x${videoRef.current?.videoHeight || 0}`,
+          size: fileSize
         };
         await saveGalleryItem(newItem);
         setGalleryItems(prev => [newItem, ...prev]);
@@ -812,6 +841,7 @@ export default function LiveChat() {
 
                       if (imageUrl) {
                         lastGeneratedImageUrlRef.current = imageUrl;
+                        setLatestGeneratedImage(imageUrl);
                         setMessages(prev => prev.map(m => m.id === imageMsgId ? {
                           ...m,
                           text: parts.length > 1 ? `Edited image based on: "${prompt}"` : `Generated image for: "${prompt}"`,
@@ -1030,10 +1060,8 @@ export default function LiveChat() {
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
       if (showAudioMenu || showVideoMenu) {
-        // We can't easily use refs for the menus since they are conditionally rendered
-        // but we can check if the click target is within a menu container
         const target = event.target as HTMLElement;
-        if (!target.closest('.relative')) {
+        if (!target.closest('.menu-container')) {
           setShowAudioMenu(false);
           setShowVideoMenu(false);
         }
@@ -1073,7 +1101,79 @@ export default function LiveChat() {
   }, []);
 
   return (
-    <div className="relative flex flex-col h-full w-full bg-neutral-950 overflow-hidden">
+    <div className={`relative flex flex-col h-full w-full overflow-hidden transition-colors duration-500 ${isConnected ? 'bg-black' : 'bg-red-600'}`}>
+      {/* Latest Generated Image Mini View */}
+      <AnimatePresence>
+        {latestGeneratedImage && (
+          <motion.div
+            initial={{ opacity: 0, x: -20, scale: 0.9 }}
+            animate={{ opacity: 1, x: 0, scale: 1 }}
+            exit={{ opacity: 0, x: -20, scale: 0.9 }}
+            className="absolute top-4 left-4 z-40 rounded-xl overflow-hidden border-2 border-blue-500/50 shadow-2xl shadow-blue-500/10 cursor-pointer group"
+            onClick={() => setShowLargeGeneratedImage(true)}
+          >
+            <Image src={latestGeneratedImage} alt="Latest generated" width={120} height={90} className="object-cover transition-transform duration-300 group-hover:scale-110" unoptimized />
+            <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-1">
+              <Eye className="w-4 h-4 text-white" />
+              <span className="text-white text-xs font-medium">View</span>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Large Generated Image Modal */}
+      <AnimatePresence>
+        {showLargeGeneratedImage && latestGeneratedImage && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="absolute inset-0 z-50 flex items-center justify-center bg-black/90 backdrop-blur-md p-4"
+            onClick={() => setShowLargeGeneratedImage(false)}
+          >
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.9, opacity: 0 }}
+              className="relative max-w-5xl w-full max-h-[90vh] flex items-center justify-center"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Image 
+                src={latestGeneratedImage} 
+                alt="Large generated view" 
+                width={1920} 
+                height={1080} 
+                className="w-full h-full object-contain rounded-2xl" 
+                unoptimized 
+              />
+              <button
+                onClick={() => setShowLargeGeneratedImage(false)}
+                className="absolute top-4 right-4 p-2 bg-black/50 hover:bg-black/80 text-white rounded-full backdrop-blur-md transition-colors"
+              >
+                <X className="w-6 h-6" />
+              </button>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Recent Shot Toast */}
+      <AnimatePresence>
+        {recentShot && (
+          <motion.div
+            initial={{ opacity: 0, y: -20, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.9 }}
+            className="absolute top-4 right-4 z-50 rounded-xl overflow-hidden border-2 border-green-500 shadow-2xl shadow-green-500/20"
+          >
+            <Image src={recentShot} alt="Recent shot" width={120} height={90} className="object-cover" unoptimized />
+            <div className="absolute bottom-0 inset-x-0 bg-green-500 text-white text-[10px] font-bold text-center py-0.5 uppercase tracking-wider">
+              Captured
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Settings Modal */}
       {isSettingsOpen && (
         <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
@@ -1094,6 +1194,7 @@ export default function LiveChat() {
                   className="w-full bg-neutral-950 border border-neutral-800 rounded-lg px-3 py-2 text-neutral-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
                 >
                   <option value="gemini-2.5-flash-native-audio-preview-12-2025">Gemini 2.5 Flash Native Audio</option>
+                  <option value="gemini-3.1-flash-live-preview">Gemini 3.1 Flash Live Preview</option>
                   <option value="gemini-3.1-flash-preview">Gemini 3.1 Flash Preview</option>
                   <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro Preview</option>
                 </select>
@@ -1178,14 +1279,14 @@ export default function LiveChat() {
         autoPlay 
         playsInline 
         muted 
-        className={`absolute inset-0 w-full h-full object-cover z-0 ${isVideoEnabled ? 'block' : 'hidden'}`}
+        className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[90vw] h-auto object-contain z-0 ${isVideoEnabled ? 'block' : 'hidden'}`}
       />
       {/* Dark gradient overlay to make text readable over video */}
       {isVideoEnabled && (
         <div className="absolute inset-0 bg-gradient-to-b from-black/40 via-black/20 to-black/80 z-0 pointer-events-none" />
       )}
       {!isVideoEnabled && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center text-neutral-600 z-0 bg-neutral-900">
+        <div className="absolute inset-0 flex flex-col items-center justify-center text-neutral-600 z-0">
           <VideoOff className="w-16 h-16 mb-4 opacity-20" />
           <p className="opacity-50">Camera is off</p>
         </div>
@@ -1194,114 +1295,22 @@ export default function LiveChat() {
 
       {/* Chat UI Overlay */}
       <div className="relative z-10 flex flex-col h-full w-full max-w-[95vw] mx-auto">
-        <div className="p-4 bg-gradient-to-b from-black/80 to-transparent flex justify-end items-center transition-all duration-300 hover:bg-black/90">
-          <div className="flex items-center gap-2">
-            <button 
-              onMouseDown={handleShotDown}
-              onMouseUp={handleShotUp}
-              onMouseLeave={handleShotUp}
-              onTouchStart={handleShotDown}
-              onTouchEnd={handleShotUp}
-              className={`p-2.5 rounded-xl transition-all duration-300 shadow-2xl flex items-center justify-center group relative ${
-                isRecordingVideo 
-                  ? 'bg-red-600 text-white animate-pulse scale-110' 
-                  : 'bg-neutral-900/60 text-neutral-300 border border-neutral-800/50 hover:bg-neutral-800/80 hover:scale-105'
-              }`}
-              title="Click for Photo, Hold for Video"
-              disabled={!isConnected}
-            >
-              <Camera className={`w-5 h-5 ${isRecordingVideo ? 'hidden' : 'block'}`} />
-              {isRecordingVideo && <Film className="w-5 h-5" />}
-              {isRecordingVideo && (
-                <span className="absolute -top-1 -right-1 flex h-3 w-3">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
-                </span>
-              )}
-            </button>
-
-            <button 
-              onClick={() => setShowGallery(true)}
-              className="p-2.5 rounded-xl bg-neutral-900/60 text-neutral-300 border border-neutral-800/50 hover:bg-neutral-800/80 hover:scale-105 transition-all duration-300 shadow-2xl flex items-center justify-center relative"
-              title="Gallery"
-            >
-              <ImageIcon className="w-5 h-5" />
-              {galleryItems.length > 0 && (
-                <span className="absolute -top-1 -right-1 bg-blue-600 text-[10px] font-bold px-1.5 py-0.5 rounded-full border border-black min-w-[18px] text-center">
-                  {galleryItems.length}
-                </span>
-              )}
-            </button>
-
-            <div className="relative">
-              <button 
-                onClick={handleCameraButtonClick}
-                className={`p-2.5 rounded-xl transition-all duration-300 shadow-2xl flex items-center justify-center ${
-                  isVideoEnabled 
-                    ? 'bg-blue-600/20 text-blue-400 border border-blue-500/40 hover:bg-blue-600/30 ring-1 ring-blue-500/20' 
-                    : 'bg-neutral-900/60 text-neutral-500 border border-neutral-800/50 hover:bg-neutral-800/80 hover:text-neutral-300 hover:border-neutral-700'
-                }`}
-                title={isVideoEnabled ? 'Disable Camera' : 'Enable Camera'}
-                disabled={!isConnected}
-              >
-                {isVideoEnabled ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
-              </button>
-
-              {showVideoMenu && (
-                <div className="absolute top-full right-0 mt-2 w-56 bg-neutral-900 border border-neutral-800 rounded-xl shadow-2xl overflow-hidden z-50">
-                  <div className="p-2 border-b border-neutral-800 text-[10px] text-neutral-500 uppercase tracking-wider font-medium">Select Camera</div>
-                  <div className="max-h-48 overflow-y-auto">
-                    {videoDevices.map(device => (
-                      <button
-                        key={device.deviceId}
-                        onClick={() => changeVideoDevice(device.deviceId)}
-                        className={`w-full text-left px-4 py-2 text-sm hover:bg-neutral-800 transition-colors ${selectedVideoDevice === device.deviceId && isVideoEnabled ? 'text-blue-400 bg-blue-500/5' : 'text-neutral-300'}`}
-                      >
-                        {device.label || `Camera ${device.deviceId.slice(0, 5)}`}
-                      </button>
-                    ))}
-                  </div>
-                  <div className="border-t border-neutral-800">
-                    <button
-                      onClick={() => changeVideoDevice('screen')}
-                      className={`w-full text-left px-4 py-2 text-sm hover:bg-neutral-800 transition-colors ${selectedVideoDevice === 'screen' && isVideoEnabled ? 'text-blue-400 bg-blue-500/5' : 'text-neutral-300'}`}
-                    >
-                      Screen Share
-                    </button>
-                    <button
-                      onClick={() => changeVideoDevice('disable')}
-                      className="w-full text-left px-4 py-2 text-sm text-red-400 hover:bg-neutral-800 transition-colors"
-                    >
-                      Disable Camera
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <button 
-              onClick={() => setShowTranscription(!showTranscription)}
-              className={`p-2.5 rounded-xl transition-all duration-500 shadow-2xl flex items-center justify-center group ${
-                showTranscription 
-                  ? 'bg-blue-600/20 text-blue-400 border border-blue-500/40 hover:bg-blue-600/30 ring-1 ring-blue-500/20' 
-                  : 'bg-neutral-900/60 text-neutral-500 border border-neutral-800/50 hover:bg-neutral-800/80 hover:text-neutral-300 hover:border-neutral-700'
-              }`}
-              title={showTranscription ? 'Hide Transcription' : 'Show Transcription'}
-              disabled={!isConnected}
-            >
-              {showTranscription ? (
-                <MessageSquareText className="w-5 h-5 transition-transform duration-300 group-hover:scale-110" />
-              ) : (
-                <MessageSquare className="w-5 h-5 transition-transform duration-300 group-hover:scale-110" />
-              )}
-            </button>
-          </div>
-        </div>
-        
         <div className="flex-1 overflow-y-auto p-4 space-y-4 scroll-smooth">
           {messages.length === 0 ? (
-            <div className="h-full flex items-center justify-center text-neutral-400 text-sm text-center px-4 drop-shadow-md">
-              Connect to start a conversation. You can speak or type your messages.
+            <div className="h-full flex flex-col items-center justify-center text-neutral-400 text-sm text-center px-4 drop-shadow-md">
+              {isConnected ? (
+                <div className="flex flex-col items-center gap-2">
+                  <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+                  <p className="text-white font-medium">Connected</p>
+                  <p className="text-xs opacity-70">You can speak or type your messages.</p>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center gap-2">
+                  <div className="w-2 h-2 bg-red-500 rounded-full" />
+                  <p className="text-white font-medium">Disconnected</p>
+                  <p className="text-xs text-white">Use the call button at the bottom to connect.</p>
+                </div>
+              )}
             </div>
           ) : (
             <AnimatePresence mode="popLayout">
@@ -1471,8 +1480,110 @@ export default function LiveChat() {
             </button>
           </form>
 
-          <div className="flex items-center justify-center gap-4">
-            <div className="relative">
+          <div className="flex flex-wrap items-center justify-center gap-3 md:gap-4">
+            <button 
+              onMouseDown={handleShotDown}
+              onMouseUp={handleShotUp}
+              onMouseLeave={handleShotUp}
+              onTouchStart={handleShotDown}
+              onTouchEnd={handleShotUp}
+              className={`p-3 rounded-full transition-all duration-300 flex items-center justify-center group relative ${
+                isRecordingVideo 
+                  ? 'bg-red-600 text-white animate-pulse scale-110' 
+                  : 'bg-neutral-800 text-neutral-200 hover:bg-neutral-700'
+              }`}
+              title="Click for Photo, Hold for Video"
+              disabled={!isConnected}
+            >
+              <Camera className={`w-5 h-5 ${isRecordingVideo ? 'hidden' : 'block'}`} />
+              {isRecordingVideo && <Film className="w-5 h-5" />}
+              {isRecordingVideo && (
+                <span className="absolute -top-1 -right-1 flex h-3 w-3">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
+                </span>
+              )}
+            </button>
+
+            <button 
+              onClick={() => setShowGallery(true)}
+              className="p-3 rounded-full bg-neutral-800 text-neutral-200 hover:bg-neutral-700 transition-all duration-300 flex items-center justify-center relative"
+              title="Gallery"
+            >
+              <ImageIcon className="w-5 h-5" />
+              {galleryItems.length > 0 && (
+                <span className="absolute -top-1 -right-1 bg-blue-600 text-[10px] font-bold px-1.5 py-0.5 rounded-full border border-black min-w-[18px] text-center">
+                  {galleryItems.length}
+                </span>
+              )}
+            </button>
+
+            <div className="relative menu-container">
+              <button 
+                onClick={handleCameraButtonClick}
+                className={`p-3 rounded-full transition-all duration-300 flex items-center justify-center ${
+                  isVideoEnabled 
+                    ? 'bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 ring-1 ring-blue-500/20' 
+                    : 'bg-neutral-800 text-neutral-200 hover:bg-neutral-700'
+                }`}
+                title={isVideoEnabled ? 'Disable Camera' : 'Enable Camera'}
+                disabled={!isConnected}
+              >
+                {isVideoEnabled ? <Video className="w-5 h-5" /> : <VideoOff className="w-5 h-5" />}
+              </button>
+
+              {showVideoMenu && (
+                <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 w-56 bg-neutral-900 border border-neutral-800 rounded-xl shadow-2xl overflow-hidden z-50">
+                  <div className="p-2 border-b border-neutral-800 text-[10px] text-neutral-500 uppercase tracking-wider font-medium">Select Camera</div>
+                  <div className="max-h-48 overflow-y-auto">
+                    {videoDevices.map(device => (
+                      <button
+                        key={device.deviceId}
+                        onClick={() => changeVideoDevice(device.deviceId)}
+                        className={`w-full text-left px-4 py-2 text-sm hover:bg-neutral-800 transition-colors ${selectedVideoDevice === device.deviceId && isVideoEnabled ? 'text-blue-400 bg-blue-500/5' : 'text-neutral-300'}`}
+                      >
+                        {device.label || `Camera ${device.deviceId.slice(0, 5)}`}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="border-t border-neutral-800">
+                    <button
+                      onClick={() => changeVideoDevice('screen')}
+                      className={`w-full text-left px-4 py-2 text-sm hover:bg-neutral-800 transition-colors ${selectedVideoDevice === 'screen' && isVideoEnabled ? 'text-blue-400 bg-blue-500/5' : 'text-neutral-300'}`}
+                    >
+                      Screen Share
+                    </button>
+                    <button
+                      onClick={() => changeVideoDevice('disable')}
+                      className="w-full text-left px-4 py-2 text-sm text-red-400 hover:bg-neutral-800 transition-colors"
+                    >
+                      Disable Camera
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <button 
+              onClick={() => setShowTranscription(!showTranscription)}
+              className={`p-3 rounded-full transition-all duration-500 flex items-center justify-center group ${
+                showTranscription 
+                  ? 'bg-blue-600/20 text-blue-400 hover:bg-blue-600/30 ring-1 ring-blue-500/20' 
+                  : 'bg-neutral-800 text-neutral-200 hover:bg-neutral-700'
+              }`}
+              title={showTranscription ? 'Hide Transcription' : 'Show Transcription'}
+              disabled={!isConnected}
+            >
+              {showTranscription ? (
+                <MessageSquareText className="w-5 h-5 transition-transform duration-300 group-hover:scale-110" />
+              ) : (
+                <MessageSquare className="w-5 h-5 transition-transform duration-300 group-hover:scale-110" />
+              )}
+            </button>
+
+            <div className="hidden md:block w-px h-6 bg-neutral-800 mx-1"></div>
+
+            <div className="relative menu-container">
               <button 
                 onClick={handleAudioButtonClick}
                 className={`flex items-center gap-1 p-3 rounded-full transition-colors ${isMicMuted ? 'bg-red-500/20 text-red-500 hover:bg-red-500/30' : 'bg-neutral-800 text-neutral-200 hover:bg-neutral-700'}`}
@@ -1509,7 +1620,7 @@ export default function LiveChat() {
               )}
             </div>
             
-            <div className="w-px h-6 bg-neutral-800 mx-2"></div>
+            <div className="hidden md:block w-px h-6 bg-neutral-800 mx-1"></div>
 
             {isConnected ? (
               <button 
@@ -1534,7 +1645,7 @@ export default function LiveChat() {
               </button>
             )}
 
-            <div className="w-px h-6 bg-neutral-800 mx-2"></div>
+            <div className="hidden md:block w-px h-6 bg-neutral-800 mx-1"></div>
 
             <button 
               onClick={() => setIsSettingsOpen(true)}
@@ -1591,34 +1702,43 @@ export default function LiveChat() {
                     {galleryItems.map(item => (
                       <div 
                         key={item.id} 
-                        className="group relative aspect-square rounded-2xl overflow-hidden border border-neutral-800 bg-black hover:border-blue-500/50 transition-all cursor-pointer"
+                        className="group relative aspect-square rounded-2xl overflow-hidden border border-neutral-800 bg-black hover:border-blue-500/50 transition-all cursor-pointer flex flex-col"
                         onClick={() => setSelectedGalleryItem(item)}
                       >
-                        {item.type === 'image' ? (
-                          <Image src={item.url} alt="Captured" fill className="object-cover group-hover:scale-110 transition-transform duration-500" unoptimized />
-                        ) : (
-                          <div className="w-full h-full flex items-center justify-center bg-neutral-800">
-                            <Film className="w-8 h-8 text-neutral-500" />
-                            <div className="absolute inset-0 bg-black/20 group-hover:bg-black/0 transition-colors" />
-                          </div>
-                        )}
+                        <div className="flex-1 relative w-full h-full">
+                          {item.type === 'image' ? (
+                            <Image src={item.url} alt="Captured" fill className="object-cover group-hover:scale-110 transition-transform duration-500" unoptimized />
+                          ) : (
+                            <div className="w-full h-full flex items-center justify-center bg-neutral-800">
+                              <Film className="w-8 h-8 text-neutral-500" />
+                              <div className="absolute inset-0 bg-black/20 group-hover:bg-black/0 transition-colors" />
+                            </div>
+                          )}
+                        </div>
                         <div className="absolute top-2 left-2 px-2 py-1 rounded-md bg-black/60 backdrop-blur-md text-[10px] font-medium text-white border border-white/10 opacity-0 group-hover:opacity-100 transition-opacity">
                           {item.type.toUpperCase()}
                         </div>
-                        <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-3 gap-2">
+                        <div className="absolute bottom-0 inset-x-0 bg-black/80 backdrop-blur-md p-2 text-[10px] text-neutral-300 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col gap-0.5 z-10">
+                          <div className="flex justify-between">
+                            <span className="uppercase font-bold text-white">{item.type}</span>
+                            <span>{formatSize(item.size)}</span>
+                          </div>
+                          <div className="text-neutral-400">{item.resolution || 'Unknown resolution'}</div>
+                        </div>
+                        <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center gap-4 z-20">
                           <button 
                             onClick={(e) => { e.stopPropagation(); downloadItem(item); }}
-                            className="p-2 rounded-lg bg-blue-600 text-white hover:bg-blue-500 transition-colors"
+                            className="p-3 rounded-full bg-blue-600/80 text-white hover:bg-blue-500 transition-colors backdrop-blur-sm"
                             title="Download"
                           >
-                            <Download className="w-4 h-4" />
+                            <Download className="w-5 h-5" />
                           </button>
                           <button 
                             onClick={(e) => { e.stopPropagation(); deleteItem(item.id); }}
-                            className="p-2 rounded-lg bg-red-600 text-white hover:bg-red-500 transition-colors"
+                            className="p-3 rounded-full bg-red-600/80 text-white hover:bg-red-500 transition-colors backdrop-blur-sm"
                             title="Delete"
                           >
-                            <Trash2 className="w-4 h-4" />
+                            <Trash2 className="w-5 h-5" />
                           </button>
                         </div>
                       </div>
@@ -1680,8 +1800,11 @@ export default function LiveChat() {
                 )}
               </div>
               
-              <div className="text-neutral-400 text-sm font-medium bg-neutral-900/50 px-4 py-2 rounded-full border border-neutral-800">
-                {new Date(selectedGalleryItem.timestamp).toLocaleString()}
+              <div className="text-neutral-400 text-sm font-medium bg-neutral-900/50 px-4 py-2 rounded-full border border-neutral-800 flex flex-wrap gap-4 items-center justify-center">
+                <span>{new Date(selectedGalleryItem.timestamp).toLocaleString()}</span>
+                <span className="uppercase text-white">{selectedGalleryItem.type}</span>
+                <span>{selectedGalleryItem.resolution || 'Unknown resolution'}</span>
+                <span>{formatSize(selectedGalleryItem.size)}</span>
               </div>
             </motion.div>
           </motion.div>
