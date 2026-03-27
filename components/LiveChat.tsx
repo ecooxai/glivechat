@@ -6,6 +6,7 @@ import { GoogleGenAI, LiveServerMessage, Modality, Type, ThinkingLevel } from '@
 import { motion, AnimatePresence } from 'motion/react';
 import { AudioStreamPlayer, AudioRecorder, createWavUrl } from '@/lib/audio';
 import { Mic, MicOff, Video, VideoOff, Send, Phone, PhoneOff, Loader2, Settings, Volume2, X, ChevronDown, Plus, Trash2, MessageSquareText, MessageSquare, Camera, Image as ImageIcon, Film, Download, Eye, Bookmark, Check, FileText, Edit3, Save, History, Folder } from 'lucide-react';
+import MarkdownEditor from './MarkdownEditor';
 
 // IndexedDB Utility for permanent storage
 const DB_NAME = 'LiveChatGallery';
@@ -139,45 +140,78 @@ const formatSize = (bytes?: number) => {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 };
 
+import { diffLines, Change } from 'diff';
+
 function renderDiff(oldText: string, newText: string) {
-  const oldWords = oldText.split(/(\s+)/);
-  const newWords = newText.split(/(\s+)/);
+  const changes = diffLines(oldText, newText);
   
-  // Very simple word-level diff for visualization
-  // In a real app, we'd use a library like 'diff'
-  let result: React.ReactNode[] = [];
-  let i = 0, j = 0;
-  
-  while (i < oldWords.length || j < newWords.length) {
-    if (i < oldWords.length && j < newWords.length && oldWords[i] === newWords[j]) {
-      result.push(<span key={`match-${i}-${j}`}>{oldWords[i]}</span>);
-      i++; j++;
-    } else {
-      // Find next match
-      let found = false;
-      for (let k = j + 1; k < newWords.length; k++) {
-        if (oldWords[i] === newWords[k]) {
-          // Everything between j and k is added
-          for (let l = j; l < k; l++) {
-            result.push(<span key={`add-${l}`} className="text-blue-400 bg-blue-400/10 px-0.5 rounded">{newWords[l]}</span>);
-          }
-          j = k;
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        if (i < oldWords.length) {
-          result.push(<span key={`del-${i}`} className="text-red-400 line-through bg-red-400/10 px-0.5 rounded">{oldWords[i]}</span>);
-          i++;
-        } else if (j < newWords.length) {
-          result.push(<span key={`add-end-${j}`} className="text-blue-400 bg-blue-400/10 px-0.5 rounded">{newWords[j]}</span>);
-          j++;
-        }
-      }
+  // Find indices of changed blocks
+  const changedIndices = new Set<number>();
+  changes.forEach((change, i) => {
+    if (change.added || change.removed) {
+      changedIndices.add(i);
+      if (i > 0) changedIndices.add(i - 1);
+      if (i < changes.length - 1) changedIndices.add(i + 1);
     }
+  });
+
+  const result: React.ReactNode[] = [];
+  let lastIndex = -1;
+
+  changes.forEach((change, i) => {
+    if (!changedIndices.has(i)) return;
+
+    // Add ellipsis if we skipped some unchanged lines
+    if (lastIndex !== -1 && i > lastIndex + 1) {
+      result.push(
+        <div key={`ellipsis-${i}`} className="text-neutral-500 py-1 px-2 select-none">
+          ...
+        </div>
+      );
+    }
+    lastIndex = i;
+
+    const lines = change.value.replace(/\n$/, '').split('\n');
+    
+    if (change.added) {
+      lines.forEach((line, lineIdx) => {
+        result.push(
+          <div key={`add-${i}-${lineIdx}`} className="bg-green-500/20 text-green-300 px-2 py-0.5 border-l-2 border-green-500">
+            + {line}
+          </div>
+        );
+      });
+    } else if (change.removed) {
+      lines.forEach((line, lineIdx) => {
+        result.push(
+          <div key={`del-${i}-${lineIdx}`} className="bg-red-500/20 text-red-300 px-2 py-0.5 border-l-2 border-red-500 line-through">
+            - {line}
+          </div>
+        );
+      });
+    } else {
+      // For unchanged context, we might only want to show the last line if it's before a change,
+      // or the first line if it's after a change, to keep it compact.
+      // But for simplicity, let's just show up to 2 lines of context.
+      const contextLines = lines.length > 2 ? 
+        (i < Math.max(...Array.from(changedIndices)) ? lines.slice(-2) : lines.slice(0, 2)) 
+        : lines;
+        
+      contextLines.forEach((line, lineIdx) => {
+        result.push(
+          <div key={`ctx-${i}-${lineIdx}`} className="text-neutral-400 px-2 py-0.5 border-l-2 border-transparent">
+            &nbsp;&nbsp;{line}
+          </div>
+        );
+      });
+    }
+  });
+
+  if (result.length === 0) {
+    return <div className="text-neutral-500 italic px-2">No changes detected.</div>;
   }
-  return result;
+
+  return <div className="flex flex-col gap-0.5">{result}</div>;
 }
 
 type Message = {
@@ -343,6 +377,7 @@ export default function LiveChat() {
   const notesRef = useRef<Note[]>([]);
   const activeNoteIdRef = useRef<string | null>(null);
   const activeFolderIdRef = useRef<string | null>(null);
+  const foldersRef = useRef<Folder[]>([]);
   
   const isIntentionalDisconnectRef = useRef(false);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -364,6 +399,10 @@ export default function LiveChat() {
   useEffect(() => {
     notesRef.current = notes;
   }, [notes]);
+
+  useEffect(() => {
+    foldersRef.current = folders;
+  }, [folders]);
 
   useEffect(() => {
     activeNoteIdRef.current = activeNoteId;
@@ -444,15 +483,16 @@ export default function LiveChat() {
     
     setIsNoteSyncing(true);
     sessionRef.current.then((session: any) => {
+      const folderName = folders.find(f => f.id === note.folderId)?.name || 'General';
       session.sendRealtimeInput({
-        text: `[SYSTEM] Note Update: "${note.title}" (ID: ${note.id})\n\n${note.content}`
+        text: `[SYSTEM] Note Update: Folder "${folderName}", Note "${note.title}" (ID: ${note.id})\n\n${note.content}`
       });
       lastSyncedNoteContentRef.current[note.id] = note.content;
       lastSyncedNoteIdRef.current = note.id;
       
       setTimeout(() => setIsNoteSyncing(false), 2000);
     });
-  }, [isConnected]);
+  }, [isConnected, folders]);
 
   // Sync active note with AI after 3s of inactivity or switch
   useEffect(() => {
@@ -473,6 +513,10 @@ export default function LiveChat() {
 
     return () => clearTimeout(timer);
   }, [notes, activeNoteId, isConnected, syncNoteWithAI]);
+
+  useEffect(() => {
+    setSelectedText('');
+  }, [activeNoteId]);
 
   // Sync selected text with AI after 3s of selection
   useEffect(() => {
@@ -995,16 +1039,19 @@ export default function LiveChat() {
               const currentNotes = notesRef.current;
               const activeId = activeNoteIdRef.current;
               const activeNote = currentNotes.find(n => n.id === activeId);
+              const activeFolder = foldersRef.current.find(f => f.id === activeFolderIdRef.current) || { name: 'General' };
               
               let contextText = `[SYSTEM] Session started. Current Notes:\n`;
               if (currentNotes.length > 0) {
                 contextText += currentNotes.map(n => `ID: ${n.id}\nTitle: ${n.title}\nContent:\n${n.content}`).join('\n---\n');
                 if (activeNote) {
-                  contextText += `\n\nCURRENT ACTIVE NOTE: "${activeNote.title}" (ID: ${activeNote.id})`;
+                  contextText += `\n\nCURRENT ACTIVE NOTE: Folder "${activeFolder.name}", Note "${activeNote.title}" (ID: ${activeNote.id})`;
                 }
               } else {
                 contextText += `No notes available.`;
               }
+              
+              contextText += `\n\nINSTRUCTION: You MUST immediately greet the user by saying EXACTLY "we are in ${activeFolder.name} ${activeNote ? activeNote.title : 'but no note is selected'}". Do not add any other text.`;
               
               session.sendRealtimeInput({ text: contextText });
             });
@@ -1413,7 +1460,7 @@ If the user asks to show or hide the transcription/text history, use the 'setTra
 If the user asks to create a new note, use the 'createNote' tool.
 If the user asks to update, change, or add to their existing notes, use the 'editNote' tool. You MUST use the exact ID provided in the 'Current Notes' section or in a '[SYSTEM] Note Update' message.
 
-When you receive a message starting with '[SYSTEM] Note Update', it means the user has updated or switched to a different note. This note is now the CURRENT ACTIVE NOTE. You MUST respond ONLY with the actual title of the note (e.g., '{note name}'). Do not add any other text, commentary, or prefixes like 'ok, now we switch note'.
+When you receive a message starting with '[SYSTEM] Note Update', it means the user has updated or switched to a different note. This note is now the CURRENT ACTIVE NOTE. You MUST respond by saying EXACTLY "we are in {folder name} {note name}". Do not add any other text, commentary, or prefixes.
 
 When you receive a message starting with '[SYSTEM] User Selection', it means the user has highlighted text for your context. Respond ONLY by repeating the selected text exactly as it was provided. Do not add any other text, commentary, or prefixes.
 
@@ -2844,21 +2891,23 @@ Active Note ID: ${activeNoteId || 'None'}`,
                       }`}
                     >
                       <FileText className="w-4 h-4 shrink-0" />
-                      <span className="text-sm font-medium truncate">{note.title}</span>
-                      <button 
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const newNotes = notes.filter(n => n.id !== note.id);
-                          setNotes(newNotes);
-                          deleteNote(note.id);
-                          if (activeNoteId === note.id) {
-                            setActiveNoteId(newNotes.length > 0 ? newNotes[0].id : null);
-                          }
-                        }}
-                        className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-500/20 rounded transition-opacity"
-                      >
-                        <X className="w-3 h-3 text-red-400" />
-                      </button>
+                      <span className="text-sm font-medium truncate flex-1">{note.title}</span>
+                      {activeNoteId === note.id && (
+                        <button 
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const newNotes = notes.filter(n => n.id !== note.id);
+                            setNotes(newNotes);
+                            deleteNote(note.id);
+                            if (activeNoteId === note.id) {
+                              setActiveNoteId(newNotes.length > 0 ? newNotes[0].id : null);
+                            }
+                          }}
+                          className="p-1 hover:bg-red-500/20 rounded transition-colors shrink-0"
+                        >
+                          <X className="w-3 h-3 text-red-400" />
+                        </button>
+                      )}
                     </div>
                   ))}
                   <button 
@@ -2932,19 +2981,16 @@ Active Note ID: ${activeNoteId || 'None'}`,
                       className="bg-transparent text-2xl font-bold text-white mb-4 outline-none border-b border-transparent focus:border-blue-500/50 pb-2 transition-colors"
                       placeholder="Note Title"
                     />
-                    <textarea 
-                      value={notes.find(n => n.id === activeNoteId)?.content || ''}
-                      onChange={(e) => {
-                        const newNotes = notes.map(n => n.id === activeNoteId ? { ...n, content: e.target.value, lastModified: Date.now() } : n);
+                    <MarkdownEditor 
+                      content={notes.find(n => n.id === activeNoteId)?.content || ''}
+                      onChange={(newContent) => {
+                        const newNotes = notes.map(n => n.id === activeNoteId ? { ...n, content: newContent, lastModified: Date.now() } : n);
                         setNotes(newNotes);
                         saveNote(newNotes.find(n => n.id === activeNoteId)!);
                       }}
-                      onSelect={(e) => {
-                        const target = e.target as HTMLTextAreaElement;
-                        const text = target.value.substring(target.selectionStart, target.selectionEnd);
+                      onSelect={(text) => {
                         setSelectedText(text);
                       }}
-                      className="flex-1 bg-transparent text-neutral-300 resize-none outline-none font-mono text-sm leading-relaxed"
                       placeholder="Write your Markdown note here..."
                     />
                     <AnimatePresence>
