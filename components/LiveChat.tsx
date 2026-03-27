@@ -2,25 +2,99 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import Image from 'next/image';
-import { GoogleGenAI, LiveServerMessage, Modality, Type } from '@google/genai';
+import { GoogleGenAI, LiveServerMessage, Modality, Type, ThinkingLevel } from '@google/genai';
 import { motion, AnimatePresence } from 'motion/react';
 import { AudioStreamPlayer, AudioRecorder, createWavUrl } from '@/lib/audio';
-import { Mic, MicOff, Video, VideoOff, Send, Phone, PhoneOff, Loader2, Settings, Volume2, X, ChevronDown, Plus, Trash2, MessageSquareText, MessageSquare, Camera, Image as ImageIcon, Film, Download, Eye, Bookmark, Check } from 'lucide-react';
+import { Mic, MicOff, Video, VideoOff, Send, Phone, PhoneOff, Loader2, Settings, Volume2, X, ChevronDown, Plus, Trash2, MessageSquareText, MessageSquare, Camera, Image as ImageIcon, Film, Download, Eye, Bookmark, Check, FileText, Edit3, Save, History, Folder } from 'lucide-react';
 
 // IndexedDB Utility for permanent storage
 const DB_NAME = 'LiveChatGallery';
 const STORE_NAME = 'items';
+const NOTES_STORE = 'notes';
+const FOLDERS_STORE = 'folders';
 
 async function initDB() {
   return new Promise<IDBDatabase>((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 1);
+    const request = indexedDB.open(DB_NAME, 3);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'id' });
       }
+      if (!db.objectStoreNames.contains(NOTES_STORE)) {
+        db.createObjectStore(NOTES_STORE, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(FOLDERS_STORE)) {
+        db.createObjectStore(FOLDERS_STORE, { keyPath: 'id' });
+      }
     };
     request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function saveFolder(folder: Folder) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(FOLDERS_STORE, 'readwrite');
+    const store = transaction.objectStore(FOLDERS_STORE);
+    const request = store.put(folder);
+    request.onsuccess = () => resolve(true);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getFolders() {
+  const db = await initDB();
+  return new Promise<Folder[]>((resolve, reject) => {
+    const transaction = db.transaction(FOLDERS_STORE, 'readonly');
+    const store = transaction.objectStore(FOLDERS_STORE);
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function deleteFolder(id: string) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(FOLDERS_STORE, 'readwrite');
+    const store = transaction.objectStore(FOLDERS_STORE);
+    const request = store.delete(id);
+    request.onsuccess = () => resolve(true);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function saveNote(note: Note) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(NOTES_STORE, 'readwrite');
+    const store = transaction.objectStore(NOTES_STORE);
+    const request = store.put(note);
+    request.onsuccess = () => resolve(true);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function getNotes() {
+  const db = await initDB();
+  return new Promise<Note[]>((resolve, reject) => {
+    const transaction = db.transaction(NOTES_STORE, 'readonly');
+    const store = transaction.objectStore(NOTES_STORE);
+    const request = store.getAll();
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function deleteNote(id: string) {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(NOTES_STORE, 'readwrite');
+    const store = transaction.objectStore(NOTES_STORE);
+    const request = store.delete(id);
+    request.onsuccess = () => resolve(true);
     request.onerror = () => reject(request.error);
   });
 }
@@ -65,9 +139,50 @@ const formatSize = (bytes?: number) => {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 };
 
+function renderDiff(oldText: string, newText: string) {
+  const oldWords = oldText.split(/(\s+)/);
+  const newWords = newText.split(/(\s+)/);
+  
+  // Very simple word-level diff for visualization
+  // In a real app, we'd use a library like 'diff'
+  let result: React.ReactNode[] = [];
+  let i = 0, j = 0;
+  
+  while (i < oldWords.length || j < newWords.length) {
+    if (i < oldWords.length && j < newWords.length && oldWords[i] === newWords[j]) {
+      result.push(<span key={`match-${i}-${j}`}>{oldWords[i]}</span>);
+      i++; j++;
+    } else {
+      // Find next match
+      let found = false;
+      for (let k = j + 1; k < newWords.length; k++) {
+        if (oldWords[i] === newWords[k]) {
+          // Everything between j and k is added
+          for (let l = j; l < k; l++) {
+            result.push(<span key={`add-${l}`} className="text-blue-400 bg-blue-400/10 px-0.5 rounded">{newWords[l]}</span>);
+          }
+          j = k;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        if (i < oldWords.length) {
+          result.push(<span key={`del-${i}`} className="text-red-400 line-through bg-red-400/10 px-0.5 rounded">{oldWords[i]}</span>);
+          i++;
+        } else if (j < newWords.length) {
+          result.push(<span key={`add-end-${j}`} className="text-blue-400 bg-blue-400/10 px-0.5 rounded">{newWords[j]}</span>);
+          j++;
+        }
+      }
+    }
+  }
+  return result;
+}
+
 type Message = {
   id: string;
-  role: 'user' | 'model';
+  role: 'user' | 'model' | 'system';
   text: string;
   thought: string;
   isAudio: boolean;
@@ -81,6 +196,27 @@ type Message = {
     current?: number;
     total?: number;
   };
+};
+
+type Folder = {
+  id: string;
+  name: string;
+  createdAt: number;
+};
+
+type Note = {
+  id: string;
+  title: string;
+  content: string;
+  lastModified: number;
+  folderId: string;
+};
+
+type NoteEditProposal = {
+  noteId: string;
+  originalContent: string;
+  newContent: string;
+  description: string;
 };
 
 // Helper to check if text is effectively silent (only punctuation/whitespace/symbols)
@@ -108,7 +244,21 @@ export default function LiveChat() {
   const [showTranscription, setShowTranscription] = useState(true);
   const [galleryItems, setGalleryItems] = useState<any[]>([]);
   const [showGallery, setShowGallery] = useState(false);
+  const [showEditor, setShowEditor] = useState(false);
+  const [isNoteSyncing, setIsNoteSyncing] = useState(false);
+  const [selectedText, setSelectedText] = useState('');
+  const [isSelectionSyncing, setIsSelectionSyncing] = useState(false);
+  const [isCreatingFolder, setIsCreatingFolder] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  const [notes, setNotes] = useState<Note[]>([]);
+  const [folders, setFolders] = useState<Folder[]>([]);
+  const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
+  const [showFolderList, setShowFolderList] = useState(false);
+  const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
+  const [editProposal, setEditProposal] = useState<NoteEditProposal | null>(null);
   const [recentShot, setRecentShot] = useState<string | null>(null);
+  const lastSyncedNoteContentRef = useRef<Record<string, string>>({});
+  const lastSyncedNoteIdRef = useRef<string | null>(null);
   const [latestGeneratedImage, setLatestGeneratedImage] = useState<string | null>(null);
   const [isSaved, setIsSaved] = useState(false);
   const [showLargeGeneratedImage, setShowLargeGeneratedImage] = useState(false);
@@ -126,9 +276,45 @@ export default function LiveChat() {
   const [selectedVoice, setSelectedVoice] = useState('Zephyr');
   const [selectedModel, setSelectedModel] = useState('gemini-3.1-flash-live-preview');
   const [selectedImageModel, setSelectedImageModel] = useState('gemini-2.5-flash-image');
+  const [selectedThinkingLevel, setSelectedThinkingLevel] = useState<ThinkingLevel>(ThinkingLevel.LOW);
+
+  // Load settings from localStorage on mount
+  useEffect(() => {
+    try {
+      const savedVoice = localStorage.getItem('selectedVoice');
+      const savedModel = localStorage.getItem('selectedModel');
+      const savedImageModel = localStorage.getItem('selectedImageModel');
+      const savedThinkingLevel = localStorage.getItem('selectedThinkingLevel');
+      const savedAutoTrim = localStorage.getItem('isAutoTrimEnabled');
+
+      if (savedVoice) setSelectedVoice(savedVoice);
+      if (savedModel) setSelectedModel(savedModel);
+      if (savedImageModel) setSelectedImageModel(savedImageModel);
+      if (savedThinkingLevel) setSelectedThinkingLevel(savedThinkingLevel as ThinkingLevel);
+      if (savedAutoTrim) setIsAutoTrimEnabled(savedAutoTrim === 'true');
+    } catch (e) {
+      console.error('Failed to load settings', e);
+    }
+  }, []);
+
+  // Save settings to localStorage when they change
+  useEffect(() => {
+    try {
+      localStorage.setItem('selectedVoice', selectedVoice);
+      localStorage.setItem('selectedModel', selectedModel);
+      localStorage.setItem('selectedImageModel', selectedImageModel);
+      localStorage.setItem('selectedThinkingLevel', selectedThinkingLevel);
+      localStorage.setItem('isAutoTrimEnabled', isAutoTrimEnabled.toString());
+    } catch (e) {
+      console.error('Failed to save settings', e);
+    }
+  }, [selectedVoice, selectedModel, selectedImageModel, selectedThinkingLevel, isAutoTrimEnabled]);
 
   const prevVoiceRef = useRef(selectedVoice);
   const prevModelRef = useRef(selectedModel);
+  const prevImageModelRef = useRef(selectedImageModel);
+  const prevThinkingLevelRef = useRef(selectedThinkingLevel);
+  const prevFolderIdRef = useRef(activeFolderId);
 
   // Devices
   const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
@@ -154,6 +340,9 @@ export default function LiveChat() {
   const lastGeneratedImageUrlRef = useRef<string | null>(null);
   const userAudioBufferRef = useRef<string[]>([]);
   const activeUserMessageIdRef = useRef<string | null>(null);
+  const notesRef = useRef<Note[]>([]);
+  const activeNoteIdRef = useRef<string | null>(null);
+  const activeFolderIdRef = useRef<string | null>(null);
   
   const isIntentionalDisconnectRef = useRef(false);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -173,15 +362,49 @@ export default function LiveChat() {
   }, [selectedVideoDevice]);
 
   useEffect(() => {
-    const loadGallery = async () => {
+    notesRef.current = notes;
+  }, [notes]);
+
+  useEffect(() => {
+    activeNoteIdRef.current = activeNoteId;
+  }, [activeNoteId]);
+
+  useEffect(() => {
+    activeFolderIdRef.current = activeFolderId;
+  }, [activeFolderId]);
+
+  useEffect(() => {
+    const loadData = async () => {
       try {
-        const items = await getGalleryItems();
+        const [items, savedNotes, savedFolders] = await Promise.all([getGalleryItems(), getNotes(), getFolders()]);
         setGalleryItems(items.sort((a, b) => b.timestamp - a.timestamp));
+        
+        let currentFolders = savedFolders;
+        if (savedFolders.length === 0) {
+          const defaultFolder: Folder = {
+            id: 'default',
+            name: 'General',
+            createdAt: Date.now()
+          };
+          await saveFolder(defaultFolder);
+          currentFolders = [defaultFolder];
+        }
+        setFolders(currentFolders.sort((a, b) => b.createdAt - a.createdAt));
+        const initialFolderId = currentFolders[0].id;
+        setActiveFolderId(initialFolderId);
+
+        const updatedNotes = savedNotes.map(n => n.folderId ? n : { ...n, folderId: 'default' });
+        setNotes(updatedNotes.sort((a, b) => b.lastModified - a.lastModified));
+        
+        const folderNotes = updatedNotes.filter(n => n.folderId === initialFolderId);
+        if (folderNotes.length > 0) {
+          setActiveNoteId(folderNotes[0].id);
+        }
       } catch (err) {
-        console.error('Failed to load gallery:', err);
+        console.error('Failed to load data:', err);
       }
     };
-    loadGallery();
+    loadData();
   }, []);
 
   const isMicMutedRef = useRef(isMicMuted);
@@ -215,6 +438,69 @@ export default function LiveChat() {
       });
     }
   }, [pendingImages, isConnected]);
+
+  const syncNoteWithAI = useCallback((note: Note) => {
+    if (!isConnected || !sessionRef.current) return;
+    
+    setIsNoteSyncing(true);
+    sessionRef.current.then((session: any) => {
+      session.sendRealtimeInput({
+        text: `[SYSTEM] Note Update: "${note.title}" (ID: ${note.id})\n\n${note.content}`
+      });
+      lastSyncedNoteContentRef.current[note.id] = note.content;
+      lastSyncedNoteIdRef.current = note.id;
+      
+      setTimeout(() => setIsNoteSyncing(false), 2000);
+    });
+  }, [isConnected]);
+
+  // Sync active note with AI after 3s of inactivity or switch
+  useEffect(() => {
+    if (!isConnected || !activeNoteId) return;
+    
+    const activeNote = notes.find(n => n.id === activeNoteId);
+    if (!activeNote) return;
+
+    // Sync if content changed OR if we switched to a new note
+    const contentChanged = lastSyncedNoteContentRef.current[activeNoteId] !== activeNote.content;
+    const noteSwitched = lastSyncedNoteIdRef.current !== activeNoteId;
+
+    if (!contentChanged && !noteSwitched) return;
+
+    const timer = setTimeout(() => {
+      syncNoteWithAI(activeNote);
+    }, 3000);
+
+    return () => clearTimeout(timer);
+  }, [notes, activeNoteId, isConnected, syncNoteWithAI]);
+
+  // Sync selected text with AI after 3s of selection
+  useEffect(() => {
+    if (!isConnected || !selectedText || selectedText.trim().length < 2) return;
+
+    const timer = setTimeout(() => {
+      setIsSelectionSyncing(true);
+      sessionRef.current?.then((session: any) => {
+        session.sendRealtimeInput({
+          text: `[SYSTEM] User Selection: The user has selected the following text in their note for context:\n\n"${selectedText}"\n\nPlease keep this selection in mind for your next response.`
+        });
+        
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'system',
+          text: `Sent selection to AI`,
+          thought: '',
+          isAudio: false,
+          isComplete: true,
+          timestamp: Date.now()
+        }]);
+
+        setTimeout(() => setIsSelectionSyncing(false), 2000);
+      });
+    }, 3000);
+
+    return () => clearTimeout(timer);
+  }, [selectedText, isConnected]);
 
   const stopVideo = useCallback(() => {
     if (videoStreamRef.current) {
@@ -561,6 +847,61 @@ export default function LiveChat() {
         }]
       };
 
+      const createNoteTool = {
+        functionDeclarations: [{
+          name: 'createNote',
+          description: 'Create a new Markdown note.',
+          parameters: {
+            type: Type.OBJECT,
+            properties: {
+              title: {
+                type: Type.STRING,
+                description: 'The title of the new note.'
+              },
+              content: {
+                type: Type.STRING,
+                description: 'The initial content of the note.'
+              }
+            },
+            required: ['title', 'content']
+          }
+        }]
+      };
+
+      const editNoteTool = {
+        functionDeclarations: [{
+          name: 'editNote',
+          description: 'Edit a Markdown note. You can replace the entire note, append, prepend, or replace a specific block of text. The user will see a diff and must approve the change.',
+          parameters: {
+            type: Type.OBJECT,
+            properties: {
+              noteId: {
+                type: Type.STRING,
+                description: 'The ID of the note to edit.'
+              },
+              action: {
+                type: Type.STRING,
+                enum: ['replace', 'append', 'prepend', 'replace_text'],
+                description: 'The type of edit to perform. Use replace_text to replace a specific string with new content (e.g. to insert text at a certain line, replace the original line with the original line + the new line).'
+              },
+              targetText: {
+                type: Type.STRING,
+                description: 'The exact text to replace. ONLY required and used when action is replace_text.'
+              },
+              content: {
+                type: Type.STRING,
+                description: 'The new content to add, the full content to replace with, or the replacement text for replace_text.'
+              },
+              description: {
+                type: Type.STRING,
+                description: 'A brief description of why you are making this edit.'
+              }
+            },
+            required: ['noteId', 'action', 'content', 'description']
+          }
+        }]
+      };
+
       const setTranscriptionStateTool = {
         functionDeclarations: [{
           name: 'setTranscriptionState',
@@ -648,6 +989,25 @@ export default function LiveChat() {
             setIsConnecting(false);
             activeUserMessageIdRef.current = Date.now().toString();
             recorderRef.current?.start(selectedAudioDeviceRef.current || undefined);
+            
+            // Send current notes context immediately
+            sessionPromise.then((session: any) => {
+              const currentNotes = notesRef.current;
+              const activeId = activeNoteIdRef.current;
+              const activeNote = currentNotes.find(n => n.id === activeId);
+              
+              let contextText = `[SYSTEM] Session started. Current Notes:\n`;
+              if (currentNotes.length > 0) {
+                contextText += currentNotes.map(n => `ID: ${n.id}\nTitle: ${n.title}\nContent:\n${n.content}`).join('\n---\n');
+                if (activeNote) {
+                  contextText += `\n\nCURRENT ACTIVE NOTE: "${activeNote.title}" (ID: ${activeNote.id})`;
+                }
+              } else {
+                contextText += `No notes available.`;
+              }
+              
+              session.sendRealtimeInput({ text: contextText });
+            });
           },
           onmessage: async (message: LiveServerMessage) => {
             const parts = message.serverContent?.modelTurn?.parts;
@@ -827,6 +1187,78 @@ export default function LiveChat() {
                   });
                 }
 
+                if (call.name === 'createNote') {
+                  const { title, content } = call.args as any;
+                  const newNote: Note = {
+                    id: Date.now().toString(),
+                    title,
+                    content,
+                    lastModified: Date.now(),
+                    folderId: activeFolderIdRef.current || 'default'
+                  };
+                  setNotes(prev => [newNote, ...prev]);
+                  setActiveNoteId(newNote.id);
+                  saveNote(newNote);
+                  setShowEditor(true);
+
+                  sessionPromise.then((session: any) => {
+                    session.sendRealtimeInput({
+                      text: `[SYSTEM] Note Update: "${title}" (ID: ${newNote.id})\n\n${content}`
+                    });
+                    
+                    session.sendToolResponse({
+                      functionResponses: [{
+                        name: 'createNote',
+                        id: call.id,
+                        response: { result: `Note "${title}" created successfully with ID ${newNote.id}.` }
+                      }]
+                    });
+                  });
+                }
+
+                if (call.name === 'editNote') {
+                  const { noteId, action, content, description, targetText } = call.args as any;
+                  const note = notesRef.current.find(n => n.id === noteId);
+                  if (note) {
+                    let newContent = note.content;
+                    if (action === 'replace') newContent = content;
+                    else if (action === 'append') newContent = note.content + '\n' + content;
+                    else if (action === 'prepend') newContent = content + '\n' + note.content;
+                    else if (action === 'replace_text' && targetText) {
+                      newContent = note.content.replace(targetText, content);
+                    }
+
+                    setEditProposal({
+                      noteId,
+                      originalContent: note.content,
+                      newContent,
+                      description
+                    });
+                    setShowEditor(true);
+
+                    sessionPromise.then((session: any) => {
+                      session.sendToolResponse({
+                        functionResponses: [{
+                          name: 'editNote',
+                          id: call.id,
+                          response: { result: 'Edit proposal sent to user for approval.' }
+                        }]
+                      });
+                    });
+                  } else {
+                    sessionPromise.then((session: any) => {
+                      const availableIds = notesRef.current.map(n => n.id).join(', ');
+                      session.sendToolResponse({
+                        functionResponses: [{
+                          name: 'editNote',
+                          id: call.id,
+                          response: { error: `Note with ID ${noteId} not found. Available note IDs are: ${availableIds || 'None'}. Please use one of these IDs.` }
+                        }]
+                      });
+                    });
+                  }
+                }
+
                 if (call.name === 'generateImage') {
                   const { prompt } = call.args as any;
                   
@@ -973,10 +1405,25 @@ export default function LiveChat() {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: selectedVoice } },
           },
-          systemInstruction: "You are a helpful assistant. You can see the user if they enable their camera. You can also think before you speak. You have tools to generate or edit images, control the camera, and show/hide the transcription. If the user uploads an image and asks to change, edit, or modify it, use the 'generateImage' tool. If the user asks to open/enable or close/disable the camera, use the 'setCameraState' tool. If the user asks to show or hide the transcription/text history, use the 'setTranscriptionState' tool.",
+          systemInstruction: `You are a helpful assistant. You can see the user if they enable their camera. You can also think before you speak. You have tools to generate or edit images, control the camera, show/hide the transcription, and manage Markdown notes. 
+
+If the user uploads an image and asks to change, edit, or modify it, use the 'generateImage' tool. 
+If the user asks to open/enable or close/disable the camera, use the 'setCameraState' tool. 
+If the user asks to show or hide the transcription/text history, use the 'setTranscriptionState' tool.
+If the user asks to create a new note, use the 'createNote' tool.
+If the user asks to update, change, or add to their existing notes, use the 'editNote' tool. You MUST use the exact ID provided in the 'Current Notes' section or in a '[SYSTEM] Note Update' message.
+
+When you receive a message starting with '[SYSTEM] Note Update', it means the user has updated or switched to a different note. This note is now the CURRENT ACTIVE NOTE. You MUST respond ONLY with the actual title of the note (e.g., '{note name}'). Do not add any other text, commentary, or prefixes like 'ok, now we switch note'.
+
+When you receive a message starting with '[SYSTEM] User Selection', it means the user has highlighted text for your context. Respond ONLY by repeating the selected text exactly as it was provided. Do not add any other text, commentary, or prefixes.
+
+Current Notes:
+${notes.filter(n => n.folderId === (activeFolderId || 'default')).length > 0 ? notes.filter(n => n.folderId === (activeFolderId || 'default')).map(n => `ID: ${n.id}\nTitle: ${n.title}\nContent:\n${n.content}`).join('\n---\n') : 'No notes available.'}
+Active Note ID: ${activeNoteId || 'None'}`,
           outputAudioTranscription: {},
           inputAudioTranscription: {},
-          tools: [generateImageTool, setCameraStateTool, setTranscriptionStateTool],
+          thinkingConfig: { thinkingLevel: selectedThinkingLevel },
+          tools: [generateImageTool, setCameraStateTool, setTranscriptionStateTool, editNoteTool, createNoteTool],
         },
       });
 
@@ -985,7 +1432,7 @@ export default function LiveChat() {
       console.error("Connection error:", err);
       handleDisconnect(false);
     }
-  }, [isConnecting, isConnected, selectedModel, selectedVoice, selectedImageModel, handleDisconnect, startVideo, stopVideo]);
+  }, [isConnecting, isConnected, selectedModel, selectedVoice, selectedImageModel, selectedThinkingLevel, handleDisconnect, startVideo, stopVideo]);
 
   const disconnect = () => {
     isIntentionalDisconnectRef.current = true;
@@ -1048,12 +1495,15 @@ export default function LiveChat() {
     setPendingImages([]);
   };
 
-  // Auto-reconnect when voice or model changes while connected
+  // Auto-reconnect when voice, model, image model, thinking level, or folder changes while connected
   useEffect(() => {
     const voiceChanged = prevVoiceRef.current !== selectedVoice;
     const modelChanged = prevModelRef.current !== selectedModel;
+    const imageModelChanged = prevImageModelRef.current !== selectedImageModel;
+    const thinkingLevelChanged = prevThinkingLevelRef.current !== selectedThinkingLevel;
+    const folderChanged = prevFolderIdRef.current !== activeFolderId;
 
-    if (isConnected && (voiceChanged || modelChanged)) {
+    if (isConnected && (voiceChanged || modelChanged || imageModelChanged || thinkingLevelChanged || folderChanged)) {
       handleDisconnect(true);
       const timeout = setTimeout(() => {
         connectRef.current();
@@ -1061,12 +1511,18 @@ export default function LiveChat() {
       
       prevVoiceRef.current = selectedVoice;
       prevModelRef.current = selectedModel;
+      prevImageModelRef.current = selectedImageModel;
+      prevThinkingLevelRef.current = selectedThinkingLevel;
+      prevFolderIdRef.current = activeFolderId;
       return () => clearTimeout(timeout);
     }
 
     prevVoiceRef.current = selectedVoice;
     prevModelRef.current = selectedModel;
-  }, [selectedVoice, selectedModel, isConnected, handleDisconnect]);
+    prevImageModelRef.current = selectedImageModel;
+    prevThinkingLevelRef.current = selectedThinkingLevel;
+    prevFolderIdRef.current = activeFolderId;
+  }, [selectedVoice, selectedModel, selectedImageModel, selectedThinkingLevel, activeFolderId, isConnected, handleDisconnect]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -1405,6 +1861,23 @@ export default function LiveChat() {
           ) : (
             <AnimatePresence mode="popLayout">
               {messages.map((msg) => {
+                if (msg.role === 'system') {
+                  return (
+                    <motion.div 
+                      key={msg.id} 
+                      layout
+                      initial={{ opacity: 0, y: 5 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="flex justify-center"
+                    >
+                      <div className="bg-blue-500/10 text-blue-400 text-[10px] font-bold uppercase tracking-widest px-3 py-1 rounded-full border border-blue-400/20 flex items-center gap-2">
+                        <History className="w-3 h-3" />
+                        {msg.text}
+                      </div>
+                    </motion.div>
+                  );
+                }
+
                 const hasVisibleContent = showTranscription;
                 if (!hasVisibleContent || msg.isSilence) return null;
 
@@ -1764,7 +2237,7 @@ export default function LiveChat() {
                 
                 <div className="p-6 overflow-y-auto custom-scrollbar">
                   <div className="space-y-6 max-w-2xl mx-auto">
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
                       <div>
                         <label className="block text-sm font-medium text-neutral-400 mb-2">Model</label>
                         <select 
@@ -1792,6 +2265,21 @@ export default function LiveChat() {
                           <option value="Kore">Kore</option>
                           <option value="Fenrir">Fenrir</option>
                           <option value="Zephyr">Zephyr</option>
+                        </select>
+                        <p className="text-[10px] text-neutral-500 mt-2 uppercase tracking-wider">Session will restart on change</p>
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-medium text-neutral-400 mb-2">Thinking Level</label>
+                        <select 
+                          value={selectedThinkingLevel}
+                          onChange={(e) => setSelectedThinkingLevel(e.target.value as ThinkingLevel)}
+                          className="w-full bg-neutral-950 border border-neutral-800 rounded-xl px-4 py-3 text-neutral-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50 transition-all"
+                        >
+                          <option value={ThinkingLevel.MINIMAL}>None</option>
+                          <option value={ThinkingLevel.LOW}>Low</option>
+                          <option value={ThinkingLevel.THINKING_LEVEL_UNSPECIFIED}>Medium (Default)</option>
+                          <option value={ThinkingLevel.HIGH}>High</option>
                         </select>
                         <p className="text-[10px] text-neutral-500 mt-2 uppercase tracking-wider">Session will restart on change</p>
                       </div>
@@ -1945,6 +2433,23 @@ export default function LiveChat() {
               {galleryItems.length > 0 && (
                 <span className="absolute -top-1 -right-1 bg-blue-600 text-[10px] font-bold px-1.5 py-0.5 rounded-full border border-black min-w-[18px] text-center">
                   {galleryItems.length}
+                </span>
+              )}
+            </button>
+
+            <button 
+              onClick={() => setShowEditor(!showEditor)}
+              className={`p-3 rounded-full transition-all duration-300 flex items-center justify-center relative ${
+                showEditor 
+                  ? 'bg-blue-600/20 text-blue-400 ring-1 ring-blue-500/20' 
+                  : 'bg-neutral-800 text-neutral-200 hover:bg-neutral-700'
+              }`}
+              title="Markdown Notes"
+            >
+              <FileText className="w-5 h-5" />
+              {notes.length > 0 && (
+                <span className="absolute -top-1 -right-1 bg-blue-600 text-[10px] font-bold px-1.5 py-0.5 rounded-full border border-black min-w-[18px] text-center">
+                  {notes.length}
                 </span>
               )}
             </button>
@@ -2160,6 +2665,373 @@ export default function LiveChat() {
                 <span className="uppercase text-white">{selectedGalleryItem.type}</span>
                 <span>{selectedGalleryItem.resolution || 'Unknown resolution'}</span>
                 <span>{formatSize(selectedGalleryItem.size)}</span>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      {/* Markdown Editor Modal */}
+      <AnimatePresence>
+        {showEditor && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md"
+            onClick={() => setShowEditor(false)}
+          >
+            <motion.div 
+              initial={{ scale: 0.95, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.95, y: 20 }}
+              className="bg-neutral-900 border border-white/10 w-full max-w-4xl h-[80vh] rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+              onClick={e => e.stopPropagation()}
+            >
+              {/* Tabs */}
+              <div className="flex items-center bg-black/40 border-b border-white/10 relative">
+                {/* Folder Selector */}
+                <div className="relative shrink-0 border-r border-white/10">
+                  <button 
+                    onClick={() => setShowFolderList(!showFolderList)}
+                    className={`flex items-center gap-2 px-4 py-3 transition-all hover:scale-[1.02] active:scale-[0.98] ${showFolderList ? 'bg-blue-600/20 text-blue-400' : 'text-neutral-400 hover:bg-white/5'}`}
+                    title="Folders"
+                  >
+                    <Folder className="w-4 h-4" />
+                    <span className="text-sm font-bold max-w-[80px] truncate">
+                      {folders.find(f => f.id === activeFolderId)?.name || 'Folders'}
+                    </span>
+                    <ChevronDown className={`w-3 h-3 transition-transform ${showFolderList ? 'rotate-180' : ''}`} />
+                  </button>
+
+                  <AnimatePresence>
+                    {showFolderList && (
+                      <motion.div 
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: 10 }}
+                        className="absolute top-full left-0 w-64 bg-neutral-900 border border-white/10 shadow-2xl z-50 rounded-b-xl overflow-hidden"
+                      >
+                        <div className="p-2 border-b border-white/5 bg-black/20 flex items-center justify-between">
+                          <span className="text-[10px] uppercase tracking-widest text-neutral-500 font-bold px-2">Your Folders</span>
+                          <button 
+                            onClick={() => setIsCreatingFolder(true)}
+                            className="p-1 hover:bg-blue-600/20 text-blue-400 rounded transition-colors"
+                            title="New Folder"
+                          >
+                            <Plus className="w-3 h-3" />
+                          </button>
+                        </div>
+                        <div className="max-h-64 overflow-y-auto py-1">
+                          {isCreatingFolder ? (
+                            <div className="px-4 py-2 flex items-center gap-2 border-b border-white/5">
+                              <input
+                                autoFocus
+                                type="text"
+                                value={newFolderName}
+                                onChange={e => setNewFolderName(e.target.value)}
+                                onKeyDown={e => {
+                                  if (e.key === 'Enter' && newFolderName.trim()) {
+                                    const newFolder: Folder = { id: Date.now().toString(), name: newFolderName.trim(), createdAt: Date.now() };
+                                    setFolders(prev => [newFolder, ...prev]);
+                                    saveFolder(newFolder);
+                                    setActiveFolderId(newFolder.id);
+                                    setNewFolderName('');
+                                    setIsCreatingFolder(false);
+                                  } else if (e.key === 'Escape') {
+                                    setNewFolderName('');
+                                    setIsCreatingFolder(false);
+                                  }
+                                }}
+                                placeholder="Folder name..."
+                                className="flex-1 bg-black/50 border border-white/10 rounded px-2 py-1 text-sm text-white focus:outline-none focus:border-blue-500 min-w-0"
+                              />
+                              <button
+                                onClick={() => {
+                                  if (newFolderName.trim()) {
+                                    const newFolder: Folder = { id: Date.now().toString(), name: newFolderName.trim(), createdAt: Date.now() };
+                                    setFolders(prev => [newFolder, ...prev]);
+                                    saveFolder(newFolder);
+                                    setActiveFolderId(newFolder.id);
+                                    setNewFolderName('');
+                                    setIsCreatingFolder(false);
+                                  }
+                                }}
+                                className="p-1 text-green-400 hover:bg-green-400/20 rounded shrink-0"
+                              >
+                                <Check className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={() => {
+                                  setNewFolderName('');
+                                  setIsCreatingFolder(false);
+                                }}
+                                className="p-1 text-neutral-400 hover:bg-white/10 rounded shrink-0"
+                              >
+                                <X className="w-3 h-3" />
+                              </button>
+                            </div>
+                          ) : (
+                            <button 
+                              onClick={() => setIsCreatingFolder(true)}
+                              className="w-full text-left px-4 py-2 text-sm cursor-pointer flex items-center gap-2 text-blue-400 hover:bg-blue-600/10 transition-colors border-b border-white/5"
+                            >
+                              <Plus className="w-3 h-3" />
+                              <span className="font-medium">Create New Folder</span>
+                            </button>
+                          )}
+                          {folders.map(folder => (
+                            <div 
+                              key={folder.id}
+                              onClick={() => {
+                                setActiveFolderId(folder.id);
+                                setShowFolderList(false);
+                                // Filter notes for this folder and set active note
+                                const folderNotes = notes.filter(n => n.folderId === folder.id);
+                                if (folderNotes.length > 0) {
+                                  setActiveNoteId(folderNotes[0].id);
+                                } else {
+                                  setActiveNoteId(null);
+                                }
+                                // Reconnect to update AI context
+                                handleDisconnect(true);
+                              }}
+                              className={`px-4 py-2 text-sm cursor-pointer flex items-center justify-between group transition-colors ${
+                                activeFolderId === folder.id ? 'bg-blue-600/10 text-blue-400' : 'text-neutral-400 hover:bg-white/5'
+                              }`}
+                            >
+                              <div className="flex items-center gap-2 truncate">
+                                <Folder className="w-3 h-3 opacity-50" />
+                                <span className="truncate">{folder.name}</span>
+                              </div>
+                              {folder.id !== 'default' && (
+                                <button 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    if (confirm(`Delete folder "${folder.name}" and all its notes?`)) {
+                                      const newFolders = folders.filter(f => f.id !== folder.id);
+                                      setFolders(newFolders);
+                                      deleteFolder(folder.id);
+                                      // Also delete notes in this folder
+                                      const notesToDelete = notes.filter(n => n.folderId === folder.id);
+                                      notesToDelete.forEach(n => deleteNote(n.id));
+                                      setNotes(prev => prev.filter(n => n.folderId !== folder.id));
+                                      if (activeFolderId === folder.id) {
+                                        setActiveFolderId('default');
+                                      }
+                                    }
+                                  }}
+                                  className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-500/20 rounded transition-opacity"
+                                >
+                                  <Trash2 className="w-3 h-3 text-red-400" />
+                                </button>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </motion.div>
+                    )}
+                  </AnimatePresence>
+                </div>
+
+                {/* Note Tabs */}
+                <div className="flex-1 flex items-center overflow-x-auto scrollbar-hide">
+                  {notes.filter(n => n.folderId === activeFolderId).map(note => (
+                    <div 
+                      key={note.id}
+                      onClick={() => setActiveNoteId(note.id)}
+                      className={`flex items-center gap-2 px-4 py-3 cursor-pointer border-r border-white/5 transition-colors min-w-[120px] max-w-[200px] shrink-0 group ${
+                        activeNoteId === note.id ? 'bg-blue-600/10 text-blue-400' : 'text-neutral-400 hover:bg-white/5'
+                      }`}
+                    >
+                      <FileText className="w-4 h-4 shrink-0" />
+                      <span className="text-sm font-medium truncate">{note.title}</span>
+                      <button 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          const newNotes = notes.filter(n => n.id !== note.id);
+                          setNotes(newNotes);
+                          deleteNote(note.id);
+                          if (activeNoteId === note.id) {
+                            setActiveNoteId(newNotes.length > 0 ? newNotes[0].id : null);
+                          }
+                        }}
+                        className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-500/20 rounded transition-opacity"
+                      >
+                        <X className="w-3 h-3 text-red-400" />
+                      </button>
+                    </div>
+                  ))}
+                  <button 
+                    onClick={() => {
+                      const newNote: Note = {
+                        id: Date.now().toString(),
+                        title: 'Untitled Note',
+                        content: '',
+                        lastModified: Date.now(),
+                        folderId: activeFolderId || 'default'
+                      };
+                      setNotes(prev => [newNote, ...prev]);
+                      setActiveNoteId(newNote.id);
+                      saveNote(newNote);
+                    }}
+                    className="shrink-0 p-3 text-neutral-400 hover:text-white hover:bg-white/5 transition-colors"
+                    title="New Note"
+                  >
+                    <Plus className="w-5 h-5" />
+                  </button>
+                </div>
+                
+                <div className="shrink-0 ml-auto px-4 flex items-center gap-4 border-l border-white/10">
+                  <AnimatePresence>
+                    {isNoteSyncing ? (
+                      <motion.div 
+                        initial={{ opacity: 0, x: 10 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        exit={{ opacity: 0, x: 10 }}
+                        className="flex items-center justify-center text-blue-400 bg-blue-400/10 p-2 rounded-full border border-blue-400/20"
+                        title="Syncing..."
+                      >
+                        <History className="w-4 h-4 animate-spin" />
+                      </motion.div>
+                    ) : (
+                      isConnected && activeNoteId && (
+                          <button 
+                            onClick={() => {
+                              const note = notes.find(n => n.id === activeNoteId);
+                              if (note) syncNoteWithAI(note);
+                            }}
+                            className="flex items-center justify-center text-neutral-400 hover:text-blue-400 bg-white/5 hover:bg-blue-400/10 p-2 rounded-full border border-white/10 hover:border-blue-400/20 transition-all"
+                            title="Sync with AI now"
+                          >
+                            <History className="w-4 h-4" />
+                          </button>
+                      )
+                    )}
+                  </AnimatePresence>
+                  <button 
+                    onClick={() => setShowEditor(false)}
+                    className="p-2 text-neutral-400 hover:text-white transition-colors"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Editor Content */}
+              <div className="flex-1 flex flex-col p-6 overflow-hidden relative">
+                {activeNoteId ? (
+                  <>
+                    <input 
+                      type="text"
+                      value={notes.find(n => n.id === activeNoteId)?.title || ''}
+                      onChange={(e) => {
+                        const newNotes = notes.map(n => n.id === activeNoteId ? { ...n, title: e.target.value, lastModified: Date.now() } : n);
+                        setNotes(newNotes);
+                        saveNote(newNotes.find(n => n.id === activeNoteId)!);
+                      }}
+                      className="bg-transparent text-2xl font-bold text-white mb-4 outline-none border-b border-transparent focus:border-blue-500/50 pb-2 transition-colors"
+                      placeholder="Note Title"
+                    />
+                    <textarea 
+                      value={notes.find(n => n.id === activeNoteId)?.content || ''}
+                      onChange={(e) => {
+                        const newNotes = notes.map(n => n.id === activeNoteId ? { ...n, content: e.target.value, lastModified: Date.now() } : n);
+                        setNotes(newNotes);
+                        saveNote(newNotes.find(n => n.id === activeNoteId)!);
+                      }}
+                      onSelect={(e) => {
+                        const target = e.target as HTMLTextAreaElement;
+                        const text = target.value.substring(target.selectionStart, target.selectionEnd);
+                        setSelectedText(text);
+                      }}
+                      className="flex-1 bg-transparent text-neutral-300 resize-none outline-none font-mono text-sm leading-relaxed"
+                      placeholder="Write your Markdown note here..."
+                    />
+                    <AnimatePresence>
+                      {isSelectionSyncing && (
+                        <motion.div 
+                          initial={{ opacity: 0, scale: 0.9, y: 10 }}
+                          animate={{ opacity: 1, scale: 1, y: 0 }}
+                          exit={{ opacity: 0, scale: 0.9, y: 10 }}
+                          className="absolute bottom-10 right-10 z-30 bg-blue-600/90 text-white text-[10px] font-bold uppercase tracking-widest px-4 py-2 rounded-full border border-blue-400/30 flex items-center gap-2 shadow-2xl backdrop-blur-md"
+                        >
+                          <Eye className="w-4 h-4" />
+                          AI is reading selection...
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </>
+                ) : (
+                  <div className="flex-1 flex flex-col items-center justify-center text-neutral-500 gap-4">
+                    <FileText className="w-16 h-16 opacity-20" />
+                    <p>No notes yet. Create one to get started!</p>
+                    <button 
+                      onClick={() => {
+                        const newNote: Note = {
+                          id: Date.now().toString(),
+                          title: 'Untitled Note',
+                          content: '',
+                          lastModified: Date.now(),
+                          folderId: activeFolderId || 'default'
+                        };
+                        setNotes([newNote]);
+                        setActiveNoteId(newNote.id);
+                        saveNote(newNote);
+                      }}
+                      className="px-6 py-2 bg-blue-600 text-white rounded-full hover:bg-blue-500 transition-colors"
+                    >
+                      Create First Note
+                    </button>
+                  </div>
+                )}
+
+                {/* Edit Proposal Overlay */}
+                <AnimatePresence>
+                  {editProposal && (
+                    <motion.div 
+                      initial={{ opacity: 0, y: 50 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0, y: 50 }}
+                      className="absolute inset-x-0 bottom-0 bg-neutral-900 border-t border-blue-500/30 p-6 shadow-[0_-10px_40px_rgba(0,0,0,0.5)] z-20"
+                    >
+                      <div className="flex items-center justify-between mb-4">
+                        <div className="flex items-center gap-2">
+                          <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center">
+                            <Edit3 className="w-4 h-4 text-white" />
+                          </div>
+                          <div>
+                            <h3 className="text-white font-bold">AI Edit Proposal</h3>
+                            <p className="text-xs text-neutral-400">{editProposal.description}</p>
+                          </div>
+                        </div>
+                        <div className="flex gap-3">
+                          <button 
+                            onClick={() => setEditProposal(null)}
+                            className="p-3 rounded-full bg-neutral-800 text-white hover:bg-neutral-700 transition-colors shadow-lg active:scale-95"
+                            title="Discard"
+                          >
+                            <X className="w-5 h-5" />
+                          </button>
+                          <button 
+                            onClick={() => {
+                              const newNotes = notes.map(n => n.id === editProposal.noteId ? { ...n, content: editProposal.newContent, lastModified: Date.now() } : n);
+                              setNotes(newNotes);
+                              saveNote(newNotes.find(n => n.id === editProposal.noteId)!);
+                              setEditProposal(null);
+                            }}
+                            className="p-3 rounded-full bg-blue-600 text-white hover:bg-blue-500 transition-colors shadow-lg shadow-blue-600/20 active:scale-95"
+                            title="Apply Changes"
+                          >
+                            <Check className="w-5 h-5" />
+                          </button>
+                        </div>
+                      </div>
+                      <div className="bg-black/40 rounded-xl p-4 max-h-[30vh] overflow-y-auto font-mono text-sm whitespace-pre-wrap leading-relaxed border border-white/5">
+                        {renderDiff(editProposal.originalContent, editProposal.newContent)}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
               </div>
             </motion.div>
           </motion.div>
